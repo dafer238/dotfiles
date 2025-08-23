@@ -1,0 +1,9 @@
+docker-desktop
+ipscan
+molequeue
+neofetch
+phonon-qt6-mpv
+yay
+yay-debug
+zotero
+zotero-debug

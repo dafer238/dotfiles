@@ -1,0 +1,8 @@
+[Applications][firefox]
+Seen=true
+
+[DoNotDisturb]
+WhenFullscreen=false
+
+[Notifications]
+PopupPosition=BottomRight
