@@ -10,7 +10,7 @@
 ################################################################################
 
 # Theme
-theme = GruvboxDark
+theme = Gruvbox Dark
 
 # Font settings
 font-family = "CaskaydiaCove Nerd Font Mono"
