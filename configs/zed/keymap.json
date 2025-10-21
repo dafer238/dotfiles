@@ -1,0 +1,86 @@
+// Zed keymap
+//
+// For information on binding keys, see the Zed
+// documentation: https://zed.dev/docs/key-bindings
+//
+// To see the default key bindings run `zed: open default keymap`
+// from the command palette.
+[
+  // ── Normal mode workspace bindings ───────────────
+  {
+    "context": "Workspace",
+    "bindings": {
+      ";": "command_palette::Toggle"
+    }
+  },
+  // ── Normal mode editor navigation ────────────────
+  {
+    "context": "Editor && vim_mode != insert && mode == full",
+    "bindings": {
+      ";": "command_palette::Toggle",
+      "space space": "tab_switcher::ToggleAll",
+      "space t": "project_panel::ToggleFocus",
+      "space g g": "git_panel::ToggleFocus",
+      // Centered scrolling
+      "ctrl-shift-u": "vim::ScrollUp",
+      "ctrl-shift-d": "vim::ScrollDown",
+      "ctrl-u": ["workspace::SendKeystrokes", "ctrl-shift-u z z"],
+      "ctrl-d": ["workspace::SendKeystrokes", "ctrl-shift-d z z"],
+      // Centered searching next
+      "ctrl-shift-n": "vim::MoveToNextMatch",
+      "n": ["workspace::SendKeystrokes", "ctrl-shift-n z z"],
+      // Convenience shortcuts
+      "space f m": "editor::Format",
+      "space s f": "file_finder::Toggle",
+      "space s g": "project_search::ToggleFocus",
+      "space c a": "editor::ToggleCodeActions",
+      "space d b": "debugger::Start",
+      "space s n": "zed::OpenSettings",
+      "f2": "editor::Rename",
+      "alt-k": "vim::GoToTab",
+      "alt-j": "vim::GoToPreviousTab",
+      "ctrl-alt-t": "workspace::NewTerminal",
+      "ctrl-w": "tab_switcher::CloseSelectedItem"
+    }
+  },
+  // ── Insert mode convenience ──────────────────────
+  {
+    "context": "Editor && vim_mode == insert && !VimWaiting && !menu",
+    "bindings": {
+      "j k": "vim::NormalBefore"
+    }
+  },
+  // ── Explorer panel ───────────────────────────────
+  {
+    "context": "(ProjectPanel && not_editing)",
+    "bindings": {
+      "space": null,
+      "space t": "workspace::ToggleLeftDock",
+      "space g g": "git_panel::ToggleFocus"
+    }
+  },
+  // ── Git panel
+  {
+    "context": "(GitPanel && ChangesList)",
+    "bindings": {
+      "space": null,
+      "space g g": "workspace::ToggleLeftDock",
+      "space t": "project_panel::ToggleFocus"
+    }
+  },
+  // ── Terminal focus ───────────────────────────────
+  {
+    "context": "Terminal",
+    "bindings": {
+      "ctrl-w": "pane::CloseActiveItem"
+    }
+  },
+  // ── Code actions navigations ─────────────────────
+  {
+    "context": "(Editor && (showing_code_actions))",
+    "bindings": {
+      "j": "editor::ContextMenuNext",
+      "k": "editor::ContextMenuPrevious"
+    }
+  }
+]
