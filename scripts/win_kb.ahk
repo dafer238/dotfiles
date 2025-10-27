@@ -1,6 +1,8 @@
 ; AutoHotkey v2 script
 ; Caps Lock: Tap for Escape, Hold for Shift
-; Then map Caps Lock to Escape
+; Left shift as ctrl
+; Super (Windows) + Q closes current window
+
 
 #Requires AutoHotkey v2.0
 
@@ -47,6 +49,16 @@ CapsLock up::
 ; Additional mapping: Map Caps Lock to Escape (this will override the above when uncommented)
 ; If you want a simple Caps Lock -> Escape mapping instead, uncomment the line below:
 ; CapsLock::Escape
+
+; --- Left Shift acts as Left Ctrl ---
+LShift::
+{
+    Send "{LCtrl down}"
+}
+LShift up::
+{
+    Send "{LCtrl up}"
+}
 
 ; --- Additional Shortcuts ---
 
