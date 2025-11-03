@@ -29,6 +29,7 @@ ln -sfn ~/dev/configs/.zshrc ~/.zshrc
 ln -sfn ~/dev/configs/.tmux.conf ~/.tmux.conf
 ln -sfn ~/dev/configs/starship.toml ~/.config/starship.toml
 ln -sfn ~/dev/configs/nvim ~/.config/nvim
+ln -sfn ~/dev/configs/zed ~/.config/zed
 ```
 
 ## Pleasant development experience
