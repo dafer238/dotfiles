@@ -7,72 +7,105 @@
 // custom settings, run `zed: open default settings` from the
 // command palette (cmd-shift-p / ctrl-shift-p)
 {
-  "ui_font_size": 18.0,
-  "ui_font_family": "Cascadia Code",
-  "buffer_font_size": 18.0,
+  // Appearance and UI settings
   "buffer_font_family": "Cascadia Code",
-  "vim_mode": true,
+  "buffer_font_size": 18.0,
+  "icon_theme": {
+    "dark": "Material Icon Theme",
+    "light": "Material Icon Theme",
+    "mode": "system"
+  },
+  // "relative_line_numbers": true,
+  "scroll_beyond_last_line": "vertical_scroll_margin",
+  "tab_bar": {
+    "show": true
+  },
+  "tabs": {
+    "file_icons": true,
+    "git_status": true,
+    "show_diagnostics": "errors"
+  },
+  "theme": {
+    "dark": "Ayu Mirage",
+    "light": "Gruvbox Light",
+    "mode": "system"
+  },
+  "title_bar": {
+    "show_branch_icon": true
+  },
+  "toolbar": {
+    "breadcrumbs": false,
+    "quick_actions": false
+  },
+  "ui_font_family": "Cascadia Code",
+  "ui_font_size": 18.0,
+  "show_whitespaces": "trailing",
+  "preferred_line_length": 100,
+  "vertical_scroll_margin": 5.0,
+
+  // Behavior and Editing
   "autosave": "on_focus_change",
   "format_on_save": "on",
-  "theme": {
-    "mode": "system",
-    "light": "Gruvbox Light",
-    "dark": "Ayu Mirage"
+  "vim_mode": true,
+
+  // Debugger configuration
+  "debugger": {
+    "timeout": 10000
   },
-  "icon_theme": {
-    "mode": "system",
-    "light": "Material Icon Theme",
-    "dark": "Material Icon Theme"
-  },
-  "disable_ai": true,
-  "inline_code_actions": true,
+
+  // Git integration
   "git": {
     "inline_blame": {
       "enabled": false
     }
   },
-  "tab_bar": {
-    "show": true
-  },
-  "terminal": {
-    "toolbar": {
-      "breadcrumbs": false
-    },
-    "font_size": 14.0,
-    "copy_on_select": true,
-    "working_directory": "current_project_directory"
-  },
-  "tabs": {
-    "file_icons": true,
-    "git_status": true
-  },
-  "title_bar": {
-    "show_branch_icon": true
-  },
-  "project_panel": {
-    "indent_size": 15.0,
-    "entry_spacing": "standard"
-  },
-  "file_finder": {
-    "modal_max_width": "medium"
-  },
-  "diagnostics": {
-    "inline": {
-      "min_column": 90,
-      "enabled": true
+
+  // Language-specific settings
+  "languages": {
+    "Python": {
+      "language_servers": [
+        // "basedpyright",
+        "ruff",
+        "ty"
+      ]
     }
   },
-  "show_whitespaces": "trailing",
-  "show_edit_predictions": false,
-  "indent_guides": {
-    "active_line_width": 2
+
+  // Project and file management
+  "file_finder": {
+    "modal_max_width": "large"
   },
-  "preferred_line_length": 90,
-  "toolbar": {
-    "quick_actions": false,
-    "breadcrumbs": false
+  "file_scan_exclusions": ["**/__pycache__", "**/.vscode"],
+  "project_panel": {
+    "entry_spacing": "standard"
   },
-  "relative_line_numbers": true,
-  "scroll_beyond_last_line": "vertical_scroll_margin",
-  "vertical_scroll_margin": 5.0
+
+  // Terminal settings
+  "terminal": {
+    "copy_on_select": true,
+    "font_size": 14.0,
+    "working_directory": "current_project_directory"
+  },
+
+  // Diagnostics and linting
+  "diagnostics": {
+    "inline": {
+      "enabled": true,
+      "min_column": 50
+    }
+  },
+
+  // AI and Agent configuration
+  "disable_ai": false,
+  "agent": {
+    "always_allow_tool_actions": true,
+    "default_model": {
+      "model": "claude-sonnet-4.5",
+      "provider": "copilot_chat"
+    },
+    "default_profile": "write",
+    "notify_when_agent_waiting": "all_screens",
+    "play_sound_when_agent_done": true
+  },
+  "show_edit_predictions": false
 }
