@@ -12,6 +12,7 @@ eval "$(starship init zsh)"
 
 # Add cargo to path
 # source "$HOME/.cargo/env"
+export PATH="$HOME/.cargo/bin:$PATH"
 
 # Automatically attach to the last session or create a new one
 if [[ -z "$TMUX" ]]; then
