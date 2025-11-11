@@ -1,0 +1,24 @@
+[package]
+name = "python-venv-tools"
+version = "1.0.0"
+edition = "2024"
+authors = ["dafer"]
+description = "Python virtual environment management tools - APE and SPE"
+
+[[bin]]
+name = "ape"
+path = "ape.rs"
+
+[[bin]]
+name = "spe"
+path = "spe.rs"
+
+[dependencies]
+walkdir = "2.5"
+rayon = "1.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
