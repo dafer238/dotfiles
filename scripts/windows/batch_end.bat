@@ -1,1 +1,0 @@
-taskkill /IM batch_start.exe /F
