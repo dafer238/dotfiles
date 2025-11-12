@@ -1,1 +1,1 @@
-taskkill /IM acns.exe /F
+taskkill /IM batch_start.exe /F

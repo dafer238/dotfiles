@@ -19,6 +19,7 @@ struct Config {
     help: bool,
     verbose: bool,
     scan: bool,
+    clean: bool,
     unknown_flag: Option<String>,
 }
 
@@ -41,6 +42,25 @@ fn main() {
     }
 
     let cache_file = get_cache_path();
+
+    // Handle clean mode
+    if config.clean {
+        println!("Removing cache file...");
+        if cache_file.exists() {
+            match fs::remove_file(&cache_file) {
+                Ok(_) => {
+                    println!("Cache file removed successfully: {}", cache_file.display());
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to remove cache file at {}: {}", cache_file.display(), e);
+                }
+            }
+        } else {
+            println!("Cache file does not exist: {}", cache_file.display());
+        }
+        println!();
+        return;
+    }
     let predefined_dirs = get_predefined_dirs();
 
     if config.verbose {
@@ -153,6 +173,7 @@ fn parse_args() -> Config {
         help: false,
         verbose: false,
         scan: false,
+        clean: false,
         unknown_flag: None,
     };
 
@@ -161,6 +182,7 @@ fn parse_args() -> Config {
             "-h" | "--help" | "/?" => config.help = true,
             "-v" | "--verbose" => config.verbose = true,
             "-s" | "--scan" => config.scan = true,
+            "-c" | "--clean" => config.clean = true,
             _ => {
                 if arg.starts_with('-') && config.unknown_flag.is_none() {
                     config.unknown_flag = Some(arg.clone());
@@ -570,12 +592,15 @@ fn show_help() {
     println!("  Scans predefined directories for venv, conda, and uv environments.");
     println!();
     println!("USAGE:");
-    println!("  spe [OPTIONS]");
+    println!(
+        "  spe [OPTIONS]");
+    
     println!();
     println!("OPTIONS:");
     println!("  -h, --help       Show this help message and exit");
     println!("  -v, --verbose    Enable verbose output (shows debug information)");
     println!("  -s, --scan       Perform comprehensive scan and update cache");
+    println!("  -c, --clean      Remove the cache file and exit");
     println!();
     println!("BEHAVIOR:");
     println!("  By default, searches predefined directories quickly. Uses cached results");
@@ -605,6 +630,8 @@ fn show_help() {
     println!("  spe --scan       Scan entire user folder and update cache (same as -s)");
     println!("  spe -v           List environments with debug output");
     println!("  spe -s -v        Scan with verbose output");
+    println!("  spe -c           Remove the cache file");
+    println!("  spe --clean      Remove the cache file (same as -c)");
     println!("  spe --help       Show this help message");
     println!();
     println!("CACHE:");

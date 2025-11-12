@@ -84,6 +84,78 @@ if ($response -eq 'Y' -or $response -eq 'y') {
 }
 
 Write-Host ""
+
+# Ask if user wants to create hard links
+$hardlinkResponse = Read-Host "Create hard links in `$env:USERPROFILE\AppData\Local\Programs\scripts? (Y/N)"
+if ($hardlinkResponse -eq 'Y' -or $hardlinkResponse -eq 'y') {
+    $targetDir = "$env:USERPROFILE\AppData\Local\Programs\scripts"
+
+    # Check if target directory exists
+    if (-not (Test-Path $targetDir)) {
+        Write-Host ""
+        Write-Host "Creating directory: $targetDir" -ForegroundColor Yellow
+        try {
+            New-Item -Path $targetDir -ItemType Directory -Force | Out-Null
+            Write-Host "Directory created successfully." -ForegroundColor Green
+        } catch {
+            Write-Host "Error: Failed to create directory." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "================================" -ForegroundColor Cyan
+            Write-Host "Done!" -ForegroundColor Cyan
+            Write-Host "================================" -ForegroundColor Cyan
+            Write-Host ""
+            Read-Host "Press Enter to exit"
+            exit
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Creating hard links..." -ForegroundColor Yellow
+    Write-Host ""
+
+    # Delete existing links if they exist
+    if (Test-Path "$targetDir\ape.exe") {
+        Remove-Item "$targetDir\ape.exe" -Force
+    }
+    if (Test-Path "$targetDir\spe.exe") {
+        Remove-Item "$targetDir\spe.exe" -Force
+    }
+
+    # Get full paths
+    $apeSource = Resolve-Path "target\release\ape.exe"
+    $speSource = Resolve-Path "target\release\spe.exe"
+
+    # Create hard links
+    try {
+        New-Item -ItemType HardLink -Path "$targetDir\ape.exe" -Target $apeSource -Force -ErrorAction Stop | Out-Null
+        Write-Host "Created hard link: $targetDir\ape.exe" -ForegroundColor Green
+    } catch {
+        Write-Host "Error: Failed to create hard link for ape.exe" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+
+    try {
+        New-Item -ItemType HardLink -Path "$targetDir\spe.exe" -Target $speSource -Force -ErrorAction Stop | Out-Null
+        Write-Host "Created hard link: $targetDir\spe.exe" -ForegroundColor Green
+    } catch {
+        Write-Host "Error: Failed to create hard link for spe.exe" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+
+    Write-Host ""
+    if ((Test-Path "$targetDir\ape.exe") -and (Test-Path "$targetDir\spe.exe")) {
+        Write-Host "Hard links created successfully in: $targetDir" -ForegroundColor Green
+        Write-Host "Note: Hard links share the same file data. Rebuilding will update both." -ForegroundColor Cyan
+    } else {
+        Write-Host "Warning: Some hard links may not have been created." -ForegroundColor Yellow
+    }
+    Write-Host ""
+} else {
+    Write-Host ""
+    Write-Host "Skipping hard link creation." -ForegroundColor Yellow
+}
+
+Write-Host ""
 Write-Host "================================" -ForegroundColor Cyan
 Write-Host "Done!" -ForegroundColor Cyan
 Write-Host "================================" -ForegroundColor Cyan

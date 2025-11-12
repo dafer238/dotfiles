@@ -67,6 +67,66 @@ if /i "%COPY_FILES%"=="Y" (
     echo Or run this script again and choose 'Y' to copy automatically.
 )
 
+:: Ask if user wants to create hard links
+echo.
+set /p "CREATE_HARDLINKS=Create hard links in %%USERPROFILE%%\AppData\Local\Programs\scripts? (Y/N): "
+if /i "%CREATE_HARDLINKS%"=="Y" (
+    set "TARGET_DIR=%USERPROFILE%\AppData\Local\Programs\scripts"
+
+    :: Check if target directory exists
+    if not exist "!TARGET_DIR!" (
+        echo.
+        echo Creating directory: !TARGET_DIR!
+        mkdir "!TARGET_DIR!" 2>nul
+        if %errorlevel% neq 0 (
+            echo Error: Failed to create directory.
+            goto :skip_hardlinks
+        )
+    )
+
+    echo.
+    echo Creating hard links...
+    echo.
+
+    :: Delete existing links if they exist
+    if exist "!TARGET_DIR!\ape.exe" del "!TARGET_DIR!\ape.exe" 2>nul
+    if exist "!TARGET_DIR!\spe.exe" del "!TARGET_DIR!\spe.exe" 2>nul
+
+    :: Create hard links (mklink /H doesn't require admin privileges)
+    set "APE_SUCCESS=0"
+    set "SPE_SUCCESS=0"
+
+    mklink /H "!TARGET_DIR!\ape.exe" "%~dp0target\release\ape.exe" >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo Created hard link: !TARGET_DIR!\ape.exe
+        set "APE_SUCCESS=1"
+    ) else (
+        echo Error: Failed to create hard link for ape.exe
+    )
+
+    mklink /H "!TARGET_DIR!\spe.exe" "%~dp0target\release\spe.exe" >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo Created hard link: !TARGET_DIR!\spe.exe
+        set "SPE_SUCCESS=1"
+    ) else (
+        echo Error: Failed to create hard link for spe.exe
+    )
+
+    echo.
+    if "!APE_SUCCESS!"=="1" if "!SPE_SUCCESS!"=="1" (
+        echo Hard links created successfully in: !TARGET_DIR!
+        echo Note: Hard links share the same file data. Rebuilding will update both.
+    ) else (
+        echo Warning: Some hard links may not have been created.
+    )
+    echo.
+) else (
+    echo.
+    echo Skipping hard link creation.
+)
+
+:skip_hardlinks
+
 echo.
 echo ================================
 echo Done!

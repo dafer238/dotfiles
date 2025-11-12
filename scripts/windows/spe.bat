@@ -5,11 +5,25 @@ setlocal EnableDelayedExpansion
 if "%~1"=="" if not defined PROMPT_COMMAND set PROMPT_COMMAND=1
 
 :: ---------------------------------------------------------------------
+:: CACHE CONFIGURATION
+:: ---------------------------------------------------------------------
+set "CACHE_FILE=%TEMP%\python_venv_cache.txt"
+set "CACHE_LOCK=%TEMP%\python_venv_cache.lock"
+
+:: ---------------------------------------------------------------------
 :: CHECK FOR HELP FLAG FIRST
 :: ---------------------------------------------------------------------
 if /i "%~1"=="-h" goto :show_help
 if /i "%~1"=="--help" goto :show_help
 if /i "%~1"=="/?" goto :show_help
+
+:: ---------------------------------------------------------------------
+:: CHECK FOR CLEAN FLAG
+:: ---------------------------------------------------------------------
+if /i "%~1"=="-c" goto :clean_cache
+if /i "%~1"=="--clean" goto :clean_cache
+if /i "%~2"=="-c" goto :clean_cache
+if /i "%~2"=="--clean" goto :clean_cache
 
 :: ---------------------------------------------------------------------
 :: CHECK FOR UNKNOWN FLAGS (exit immediately if found)
@@ -30,10 +44,15 @@ if defined UNKNOWN_FLAG_ERROR (
 :: CHECK FOR SCAN FLAG
 :: ---------------------------------------------------------------------
 set "SCAN_MODE=0"
+set "CLEAN_MODE=0"
 if /i "%~1"=="--scan" set "SCAN_MODE=1"
 if /i "%~1"=="-s" set "SCAN_MODE=1"
 if /i "%~2"=="--scan" set "SCAN_MODE=1"
 if /i "%~2"=="-s" set "SCAN_MODE=1"
+if /i "%~1"=="-c" set "CLEAN_MODE=1"
+if /i "%~1"=="--clean" set "CLEAN_MODE=1"
+if /i "%~2"=="-c" set "CLEAN_MODE=1"
+if /i "%~2"=="--clean" set "CLEAN_MODE=1"
 
 :: ---------------------------------------------------------------------
 :: CHECK FOR VERBOSE FLAG
@@ -43,12 +62,6 @@ if /i "%~1"=="-v" set "VERBOSE=1"
 if /i "%~1"=="--verbose" set "VERBOSE=1"
 if /i "%~2"=="-v" set "VERBOSE=1"
 if /i "%~2"=="--verbose" set "VERBOSE=1"
-
-:: ---------------------------------------------------------------------
-:: CACHE CONFIGURATION
-:: ---------------------------------------------------------------------
-set "CACHE_FILE=%TEMP%\python_venv_cache.txt"
-set "CACHE_LOCK=%TEMP%\python_venv_cache.lock"
 
 :: ---------------------------------------------------------------------
 :: CONFIGURATION - Directories to search for environments
@@ -304,6 +317,21 @@ if %VERBOSE%==1 (
 )
 goto :eof
 
+:clean_cache
+echo Removing cache file...
+if exist "%CACHE_FILE%" (
+    del "%CACHE_FILE%" 2>nul
+    if exist "%CACHE_FILE%" (
+        echo Error: Failed to remove cache file at %CACHE_FILE%
+    ) else (
+        echo Cache file removed successfully: %CACHE_FILE%
+    )
+) else (
+    echo Cache file does not exist: %CACHE_FILE%
+)
+echo.
+goto :eof
+
 :save_cache
 if %VERBOSE%==1 echo [DEBUG] Saving cache to %CACHE_FILE%
 if %VERBOSE%==1 echo [DEBUG] Number of environments to save: %index%
@@ -363,6 +391,7 @@ echo OPTIONS:
 echo   -h, --help       Show this help message and exit
 echo   -v, --verbose    Enable verbose output (shows debug information)
 echo   -s, --scan       Perform comprehensive scan and update cache
+echo   -c, --clean      Remove the cache file and exit
 echo.
 echo BEHAVIOR:
 echo   By default, searches predefined directories quickly. Uses cached results
@@ -390,6 +419,8 @@ echo   spe -s           Scan entire user folder and update cache
 echo   spe --scan       Scan entire user folder and update cache (same as -s)
 echo   spe -v           List environments with debug output
 echo   spe -s -v        Scan with verbose output
+echo   spe -c           Remove the cache file
+echo   spe --clean      Remove the cache file (same as -c)
 echo   spe --help       Show this help message
 echo.
 echo CACHE:
@@ -414,6 +445,8 @@ if /i "%flag%"=="-v" goto :eof
 if /i "%flag%"=="--verbose" goto :eof
 if /i "%flag%"=="--scan" goto :eof
 if /i "%flag%"=="-s" goto :eof
+if /i "%flag%"=="-c" goto :eof
+if /i "%flag%"=="--clean" goto :eof
 if /i "%flag%"=="-h" goto :eof
 if /i "%flag%"=="--help" goto :eof
 if /i "%flag%"=="/?" goto :eof

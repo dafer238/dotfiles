@@ -19,6 +19,7 @@ struct Config {
     help: bool,
     verbose: bool,
     scan: bool,
+    clean: bool,
     env_name: Option<String>,
     unknown_flag: Option<String>,
 }
@@ -38,6 +39,26 @@ fn main() {
     // Show help
     if config.help {
         show_help();
+        return;
+    }
+
+    // Handle clean mode
+    if config.clean {
+        let cache_file = get_cache_path();
+        println!("Removing cache file...");
+        if cache_file.exists() {
+            match fs::remove_file(&cache_file) {
+                Ok(_) => {
+                    println!("Cache file removed successfully: {}", cache_file.display());
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to remove cache file at {}: {}", cache_file.display(), e);
+                }
+            }
+        } else {
+            println!("Cache file does not exist: {}", cache_file.display());
+        }
+        println!();
         return;
     }
 
@@ -126,6 +147,7 @@ fn parse_args() -> Config {
         help: false,
         verbose: false,
         scan: false,
+        clean: false,
         env_name: None,
         unknown_flag: None,
     };
@@ -139,6 +161,7 @@ fn parse_args() -> Config {
             "-h" | "--help" | "/?" => config.help = true,
             "-v" | "--verbose" => config.verbose = true,
             "-s" | "--scan" => config.scan = true,
+            "-c" | "--clean" => config.clean = true,
             _ => {
                 if arg.starts_with('-') {
                     // Unknown flag
@@ -552,12 +575,15 @@ fn show_help() {
     println!("  ape --scan [OPTIONS]");
     println!();
     println!("ARGUMENTS:");
-    println!("  env_name         Name of the environment to activate");
+    println!(
+        "  env_name         Name of the environment to activate");
+    
     println!();
     println!("OPTIONS:");
     println!("  -h, --help       Show this help message and exit");
     println!("  -v, --verbose    Enable verbose output (shows debug information)");
     println!("  -s, --scan       Perform comprehensive scan and update cache");
+    println!("  -c, --clean      Remove the cache file and exit");
     println!();
     println!("BEHAVIOR:");
     println!("  Searches for the specified environment using cached results (if available),");
@@ -588,6 +614,8 @@ fn show_help() {
     println!("  ape --scan             Scan entire user folder and update cache (same as -s)");
     println!("  ape -s myenv           Scan and then activate 'myenv'");
     println!("  ape -v finance         Activate 'finance' with debug output");
+    println!("  ape -c                 Remove the cache file");
+    println!("  ape --clean            Remove the cache file (same as -c)");
     println!("  ape --help             Show this help message");
     println!();
     println!("CACHE:");
