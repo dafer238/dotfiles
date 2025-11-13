@@ -17,9 +17,10 @@ set -euo pipefail
 
 # ====== CONFIGURATION ======
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PARENT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 DEFAULT_BACKUP_ROOT="$HOME/backups"
 DEFAULT_BACKUP_NAME="last_backup"
-CONFIG_FILE="${1:-$SCRIPT_DIR/backup_paths.ini}"
+CONFIG_FILE="${1:-$PARENT_DIR/backup_paths.ini}"
 
 # Performance: Use adb-sync for safety, adb pull for speed
 BACKUP_METHOD="${BACKUP_METHOD:-sync}"  # Options: sync, pull
