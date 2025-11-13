@@ -16,9 +16,10 @@
 set -euo pipefail
 
 # ====== CONFIGURATION ======
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 DEFAULT_BACKUP_ROOT="$HOME/backups"
 DEFAULT_BACKUP_NAME="last_backup"
-CONFIG_FILE="${1:-$HOME/scripts/phone_backup/backup_paths.ini}"
+CONFIG_FILE="${1:-$SCRIPT_DIR/backup_paths.ini}"
 
 # Performance: Use adb-sync for safety, adb pull for speed
 BACKUP_METHOD="${BACKUP_METHOD:-sync}"  # Options: sync, pull
@@ -229,7 +230,7 @@ prompt_continue() {
     fi
     echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-    read -p "Backup this location? [Y/n]: " response
+    read -p "Backup this location? [Y/n]: " response </dev/tty
     response="${response:-y}"
 
     if [[ "$response" =~ ^[Yy]$ ]]; then
@@ -251,9 +252,30 @@ backup_with_adb_sync() {
     # --del: delete files on destination that aren't on source (optional, commented for safety)
     # Note: adbsync automatically preserves timestamps
 
-    if adbsync pull "$source_path" "$target_dir" 2>&1 | tee -a "$LOG_FILE"; then
+    print_info "Counting files on device..." | tee -a "$LOG_FILE"
+
+    # Count files first
+    local file_count=$(adb shell "find '$source_path' -type f 2>/dev/null | wc -l" </dev/null 2>/dev/null || echo "?")
+    echo "Files to sync: $file_count" | tee -a "$LOG_FILE"
+
+    print_info "Syncing files..." | tee -a "$LOG_FILE"
+
+    # Run adbsync and capture output, show only progress
+    local temp_output=$(mktemp)
+    if adbsync pull "$source_path" "$target_dir" </dev/null > "$temp_output" 2>&1; then
+        # Count synced files and show summary
+        local synced=$(grep -c "PULL" "$temp_output" 2>/dev/null || echo "0")
+        echo "✓ Synced: $synced files" | tee -a "$LOG_FILE"
+
+        # Log full output to file only
+        cat "$temp_output" >> "$LOG_FILE"
+        rm -f "$temp_output"
         return 0
     else
+        # On error, show the error
+        echo "Error during sync:" | tee -a "$LOG_FILE"
+        tail -10 "$temp_output" | tee -a "$LOG_FILE"
+        rm -f "$temp_output"
         return 1
     fi
 }
@@ -264,7 +286,16 @@ backup_with_adb_pull() {
 
     # adb pull is faster but doesn't skip existing files
     # Good for first-time full backups
-    if adb pull "$source_path" "$parent_dir" 2>&1 | tee -a "$LOG_FILE"; then
+    print_info "Counting files on device..." | tee -a "$LOG_FILE"
+
+    # Count files first
+    local file_count=$(adb shell "find '$source_path' -type f 2>/dev/null | wc -l" </dev/null 2>/dev/null || echo "?")
+    echo "Files to pull: $file_count" | tee -a "$LOG_FILE"
+
+    print_info "Pulling files..." | tee -a "$LOG_FILE"
+
+    # Show adb pull progress bar directly in terminal (it has a nice progress display)
+    if adb pull "$source_path" "$parent_dir" </dev/null 2>&1 | tee -a "$LOG_FILE"; then
         return 0
     else
         return 1
@@ -292,37 +323,32 @@ backup_folder() {
     } | tee -a "$LOG_FILE"
 
     # Check if source exists on device
-    if ! adb shell "[ -e '$source_path' ]" 2>/dev/null; then
+    if ! adb shell "[ -e '$source_path' ]" </dev/null 2>/dev/null; then
         print_warning "Path does not exist on device: $source_path" | tee -a "$LOG_FILE"
         echo "" | tee -a "$LOG_FILE"
-        ((SKIPPED_COUNT++))
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
         return 0
     fi
 
     # Perform backup based on method
     local backup_success=false
     if [ "$BACKUP_METHOD" = "sync" ]; then
-        if backup_with_adb_sync "$source_path" "$parent_dir"; then
-            backup_success=true
-        fi
+        backup_with_adb_sync "$source_path" "$parent_dir" && backup_success=true || backup_success=false
     else
-        if backup_with_adb_pull "$source_path"
- "$parent_dir"; then
-            backup_success=true
-        fi
+        backup_with_adb_pull "$source_path" "$parent_dir" && backup_success=true || backup_success=false
     fi
 
     if [ "$backup_success" = true ]; then
         print_success "Finished: $folder" | tee -a "$LOG_FILE"
-        ((BACKED_UP_COUNT++))
+        BACKED_UP_COUNT=$((BACKED_UP_COUNT + 1))
         track_backed_up_dir "$folder"
     else
         print_error "Failed: $folder" | tee -a "$LOG_FILE"
-        ((FAILED_COUNT++))
+        FAILED_COUNT=$((FAILED_COUNT + 1))
 
         echo "You can re-run the script to resume this backup." | tee -a "$LOG_FILE"
 
-        read -p "Continue with remaining backups? [Y/n]: " continue_response
+        read -p "Continue with remaining backups? [Y/n]: " continue_response </dev/tty
         continue_response="${continue_response:-y}"
 
         if [[ ! "$continue_response" =~ ^[Yy]$ ]]; then
@@ -349,12 +375,30 @@ detect_external_drives() {
 
     case "$(uname -s)" in
         Linux*)
-            # Find mounted drives in /media and /mnt
+            # Find all removable/external drives
+            # Check /media, /mnt, and /run/media
             while IFS= read -r mount_point; do
                 if [ -n "$mount_point" ] && [ -d "$mount_point" ] && [ -w "$mount_point" ]; then
-                    drives+=("$mount_point")
+                    # Exclude system mounts
+                    if [[ ! "$mount_point" =~ ^/$ ]] && [[ ! "$mount_point" =~ ^/boot ]] && [[ ! "$mount_point" =~ ^/home$ ]]; then
+                        drives+=("$mount_point")
+                    fi
                 fi
-            done < <(df -h | grep -E '/media|/mnt' | awk '{print $6}')
+            done < <(df -h | grep -vE '(tmpfs|devtmpfs|overlay|squashfs|loop|^Filesystem)' | awk '{print $6}' | grep -E '^/(media|mnt|run/media)')
+
+            # Also check lsblk for mounted removable devices
+            if command -v lsblk &>/dev/null; then
+                while IFS= read -r mount_point; do
+                    if [ -n "$mount_point" ] && [ -d "$mount_point" ] && [ -w "$mount_point" ]; then
+                        # Check if already in array
+                        local exists=false
+                        for existing in "${drives[@]}"; do
+                            [ "$existing" = "$mount_point" ] && exists=true && break
+                        done
+                        [ "$exists" = false ] && drives+=("$mount_point")
+                    fi
+                done < <(lsblk -no MOUNTPOINT -r 2>/dev/null | grep -E '^/(media|mnt|run/media)')
+            fi
             ;;
         Darwin*)
             # macOS: Check /Volumes
@@ -409,9 +453,20 @@ prompt_external_backup() {
     mapfile -t drives < <(detect_external_drives)
 
     if [ ${#drives[@]} -eq 0 ]; then
-        print_warning "No external drives detected"
+        print_warning "No mounted external drives detected"
         echo ""
-        echo "Manual copy command:"
+
+        # Check for unmounted drives
+        if command -v lsblk &>/dev/null; then
+            echo "Unmounted removable devices found:"
+            lsblk -no NAME,SIZE,TYPE,RM,MOUNTPOINT | grep -E '(disk|part)' | awk '$4==1 && $5=="" {print "  /dev/"$1" ("$2")"}'
+            echo ""
+            echo "To mount a drive, use:"
+            echo "  sudo mount /dev/sdX1 /mnt/usb"
+            echo ""
+        fi
+
+        echo "After mounting, you can manually copy with:"
         echo "  rsync -avh --progress \"$BACKUP_DIR\" /path/to/external/drive/"
         return
     fi
@@ -465,12 +520,12 @@ prompt_external_backup() {
         printf "${MAGENTA}📂 %s${NC}\n" "$folder"
         echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-        read -p "Copy this directory to external drive? [Y/n]: " copy_response
+        read -p "Copy this directory to external drive? [Y/n]: " copy_response </dev/tty
         copy_response="${copy_response:-y}"
 
         if [[ ! "$copy_response" =~ ^[Yy]$ ]]; then
             print_warning "Skipped: $folder"
-            ((skipped_count++))
+            skipped_count=$((skipped_count + 1))
             continue
         fi
 
@@ -479,7 +534,7 @@ prompt_external_backup() {
 
         if [ ! -d "$source_path" ]; then
             print_warning "Source directory does not exist: $source_path"
-            ((skipped_count++))
+            skipped_count=$((skipped_count + 1))
             continue
         fi
 
@@ -487,7 +542,7 @@ prompt_external_backup() {
         local target_parent=$(dirname "$target_path")
         mkdir -p "$target_parent" || {
             print_error "Failed to create directory: $target_parent"
-            ((skipped_count++))
+            skipped_count=$((skipped_count + 1))
             continue
         }
 
@@ -506,12 +561,12 @@ prompt_external_backup() {
         # --append-verify: resume transfers and verify
         if rsync -avh --progress --partial --append-verify "$source_path/" "$target_path/"; then
             print_success "Copied: $folder"
-            ((copied_count++))
+            copied_count=$((copied_count + 1))
         else
             print_error "Failed to copy: $folder"
-            ((skipped_count++))
+            skipped_count=$((skipped_count + 1))
 
-            read -p "Continue with remaining directories? [Y/n]: " continue_response
+            read -p "Continue with remaining directories? [Y/n]: " continue_response </dev/tty
             continue_response="${continue_response:-y}"
 
             if [[ ! "$continue_response" =~ ^[Yy]$ ]]; then
@@ -592,12 +647,12 @@ main() {
 
     while IFS='|' read -r path_name path_desc; do
         [ -z "$path_name" ] && continue
-        ((path_count++))
+        path_count=$((path_count + 1))
 
         if prompt_continue "$path_name" "$path_desc"; then
             backup_folder "$path_name" "$path_desc"
         else
-            ((SKIPPED_COUNT++))
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
             log_message "SKIPPED: $path_name"
         fi
     done < <(parse_ini_config "$CONFIG_FILE")
