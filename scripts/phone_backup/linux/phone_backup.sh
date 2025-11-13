@@ -265,7 +265,13 @@ backup_with_adb_sync() {
     local temp_output=$(mktemp)
     if adbsync pull "$source_path" "$target_dir" </dev/null > "$temp_output" 2>&1; then
         # Count synced files and show summary
-        local synced=$(grep -c "PULL" "$temp_output" 2>/dev/null || echo "0")
+        # adbsync outputs files in a "Copy tree:" section with tree formatting (├ and └)
+        # Count only entries with file extensions (actual files, not directories)
+        local synced=$(awk '/^Copy tree:/,/^$/{if(/^Copy tree:/ || /^$/) next; print}' "$temp_output" 2>/dev/null | \
+                       grep -E "^(│| )*[├└]" | \
+                       grep -v "\.$" | \
+                       grep "\.[a-zA-Z0-9]\+$" | \
+                       wc -l)
         echo "✓ Synced: $synced files" | tee -a "$LOG_FILE"
 
         # Log full output to file only
