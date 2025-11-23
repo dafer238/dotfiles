@@ -1,5 +1,5 @@
 [submodule "configs/nvim"]
 	path = configs/nvim
-	url = git@github.com:Danisaski/neodafer.git
+	url = git@github.com:dafer238/neodafer.git
     branch = main
 
