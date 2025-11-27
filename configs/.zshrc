@@ -1,5 +1,8 @@
 # Path to your Oh My Zsh installation.
 export ZSH="$HOME/.oh-my-zsh"
+
+export LANG=en_US.UTF-8
+export LC_ALL=
     
 # Enable plugins
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
