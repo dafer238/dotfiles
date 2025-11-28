@@ -22,5 +22,5 @@ ln -sfn ~/dev/configs/zed ~/.config/zed
 ```
 
 ## Pleasant development experience
-![Terminal overview](https://github.com/dafer238/neodafer/blob/93e4b52af0d80ae918d3b730932c0e3633b8d270/images/neofetch_desktop.png)
-![Neovim setup](https://github.com/dafer238/neodafer/blob/93e4b52af0d80ae918d3b730932c0e3633b8d270/images/neovim.png)
+![Terminal overview](https://github.com/dafer238/dafer-nvim/blob/93e4b52af0d80ae918d3b730932c0e3633b8d270/images/neofetch_desktop.png)
+![Neovim setup](https://github.com/dafer238/dafer-nvim/blob/93e4b52af0d80ae918d3b730932c0e3633b8d270/images/neovim.png)
