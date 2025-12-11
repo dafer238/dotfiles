@@ -3,3 +3,7 @@
 	url = git@github.com:dafer238/dafer-nvim.git
     branch = main
 
+[submodule "configs/zed"]
+	path = configs/zed
+	url = git@github.com:dafer238/dafer-zed.git
+	branch = main
