@@ -1,18 +1,26 @@
+use colored::*;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::{self};
+use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const CACHE_FILENAME: &str = "python_venv_cache.txt";
+const CACHE_FILENAME: &str = "python_venv_cache.json";
+const CONFIG_FILENAME: &str = "python_venv_config.toml";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Environment {
     name: String,
     env_type: String,
     path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserConfig {
+    directories: Option<Vec<String>>,
 }
 
 struct Config {
@@ -20,6 +28,7 @@ struct Config {
     verbose: bool,
     scan: bool,
     clean: bool,
+    no_color: bool,
     env_name: Option<String>,
     unknown_flag: Option<String>,
 }
@@ -30,7 +39,7 @@ fn main() {
     // Check for unknown flags
     if let Some(flag) = &config.unknown_flag {
         eprintln!();
-        eprintln!("Warning: Unknown flag \"{}\"", flag);
+        print_warning(&format!("Unknown flag \"{}\"", flag), config.no_color);
         eprintln!("Run 'ape --help' for usage information.");
         eprintln!();
         return;
@@ -45,29 +54,42 @@ fn main() {
     // Handle clean mode
     if config.clean {
         let cache_file = get_cache_path();
-        println!("Removing cache file...");
+        print_info("Removing cache file...", config.no_color);
         if cache_file.exists() {
             match fs::remove_file(&cache_file) {
                 Ok(_) => {
-                    println!("Cache file removed successfully: {}", cache_file.display());
+                    print_success(
+                        &format!("Cache file removed successfully: {}", cache_file.display()),
+                        config.no_color,
+                    );
                 }
                 Err(e) => {
-                    eprintln!("Error: Failed to remove cache file at {}: {}", cache_file.display(), e);
+                    print_error(
+                        &format!(
+                            "Failed to remove cache file at {}: {}",
+                            cache_file.display(),
+                            e
+                        ),
+                        config.no_color,
+                    );
                 }
             }
         } else {
-            println!("Cache file does not exist: {}", cache_file.display());
+            print_info(
+                &format!("Cache file does not exist: {}", cache_file.display()),
+                config.no_color,
+            );
         }
         println!();
         return;
     }
 
     let cache_file = get_cache_path();
-    let predefined_dirs = get_predefined_dirs();
+    let predefined_dirs = get_search_dirs();
 
     if config.verbose {
-        println!("[DEBUG] Verbose mode enabled.");
-        println!("[DEBUG] Directories to be scanned:");
+        print_debug("Verbose mode enabled.", config.no_color);
+        print_debug("Directories to be scanned:", config.no_color);
         for dir in &predefined_dirs {
             println!("  {}", dir.display());
         }
@@ -76,17 +98,20 @@ fn main() {
 
     // Handle scan mode
     if config.scan {
-        println!("Performing comprehensive scan...");
-        println!("This may take a moment...");
+        print_info("Performing comprehensive scan...", config.no_color);
+        print_info("This may take a moment...", config.no_color);
         println!();
 
         let environments = scan_all_venvs(&config);
-        println!("Found {} environments.", environments.len());
+        print_success(
+            &format!("Found {} environments.", environments.len()),
+            config.no_color,
+        );
 
-        if let Err(e) = save_cache(&cache_file, &environments, config.verbose) {
-            eprintln!("Warning: Failed to save cache: {}", e);
+        if let Err(e) = save_cache(&cache_file, &environments, &config) {
+            print_warning(&format!("Failed to save cache: {}", e), config.no_color);
         } else {
-            println!("Cache updated.");
+            print_success("Cache updated.", config.no_color);
         }
         println!();
 
@@ -108,7 +133,7 @@ fn main() {
     let env_name = match &config.env_name {
         Some(name) => name,
         None => {
-            eprintln!("Error: No environment name specified.");
+            print_error("No environment name specified.", config.no_color);
             eprintln!();
             eprintln!("Usage: ape [OPTIONS] <env_name>");
             eprintln!("       ape --help for more information");
@@ -117,7 +142,10 @@ fn main() {
     };
 
     if config.verbose {
-        println!("[DEBUG] Searching for environment: {}", env_name);
+        print_debug(
+            &format!("Searching for environment: {}", env_name),
+            config.no_color,
+        );
         println!();
     }
 
@@ -127,7 +155,10 @@ fn main() {
     match found_env {
         Some(env) => activate_environment(&env, &config),
         None => {
-            eprintln!("Error: Environment \"{}\" not found.", env_name);
+            print_error(
+                &format!("Environment \"{}\" not found.", env_name),
+                config.no_color,
+            );
             eprintln!();
             if cache_file.exists() {
                 eprintln!(
@@ -148,6 +179,7 @@ fn parse_args() -> Config {
         verbose: false,
         scan: false,
         clean: false,
+        no_color: false,
         env_name: None,
         unknown_flag: None,
     };
@@ -162,6 +194,7 @@ fn parse_args() -> Config {
             "-v" | "--verbose" => config.verbose = true,
             "-s" | "--scan" => config.scan = true,
             "-c" | "--clean" => config.clean = true,
+            "--no-color" => config.no_color = true,
             _ => {
                 if arg.starts_with('-') {
                     // Unknown flag
@@ -188,6 +221,53 @@ fn parse_args() -> Config {
 fn get_cache_path() -> PathBuf {
     let temp_dir = env::temp_dir();
     temp_dir.join(CACHE_FILENAME)
+}
+
+fn get_config_path() -> PathBuf {
+    let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| String::from("."));
+    PathBuf::from(user_profile)
+        .join(".config")
+        .join(CONFIG_FILENAME)
+}
+
+fn load_user_config() -> Option<UserConfig> {
+    let config_path = get_config_path();
+    if !config_path.exists() {
+        return None;
+    }
+
+    match fs::read_to_string(&config_path) {
+        Ok(contents) => match toml::from_str(&contents) {
+            Ok(config) => Some(config),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    }
+}
+
+fn get_search_dirs() -> Vec<PathBuf> {
+    // First, try to load custom directories from config file
+    if let Some(user_config) = load_user_config() {
+        if let Some(dirs) = user_config.directories {
+            let custom_dirs: Vec<PathBuf> = dirs
+                .iter()
+                .map(|d| {
+                    let expanded = d.replace(
+                        "%USERPROFILE%",
+                        &env::var("USERPROFILE").unwrap_or_default(),
+                    );
+                    PathBuf::from(expanded)
+                })
+                .collect();
+
+            if !custom_dirs.is_empty() {
+                return custom_dirs;
+            }
+        }
+    }
+
+    // Fall back to predefined directories
+    get_predefined_dirs()
 }
 
 fn get_predefined_dirs() -> Vec<PathBuf> {
@@ -275,8 +355,14 @@ fn scan_all_venvs(config: &Config) -> Vec<Environment> {
     };
 
     if config.verbose {
-        println!("[DEBUG] Scanning for pyvenv.cfg files in user directory...");
-        println!("[DEBUG] Using parallel scanning for maximum speed...");
+        print_debug(
+            "Scanning for pyvenv.cfg files in user directory...",
+            config.no_color,
+        );
+        print_debug(
+            "Using parallel scanning for maximum speed...",
+            config.no_color,
+        );
     } else {
         println!("Scanning...");
     }
@@ -307,9 +393,9 @@ fn scan_all_venvs(config: &Config) -> Vec<Environment> {
     let scan_count = pyvenv_files.len();
 
     if config.verbose {
-        println!(
-            "[DEBUG] Found {} pyvenv.cfg files, processing...",
-            scan_count
+        print_debug(
+            &format!("Found {} pyvenv.cfg files, processing...", scan_count),
+            config.no_color,
         );
     }
 
@@ -330,11 +416,14 @@ fn scan_all_venvs(config: &Config) -> Vec<Environment> {
 
                 if let Some(env) = detect_environment_at_path(parent) {
                     if config.verbose {
-                        println!(
-                            "[DEBUG] Found: {} ({}) at {}",
-                            env.name,
-                            env.env_type,
-                            env.path.display()
+                        print_debug(
+                            &format!(
+                                "Found: {} ({}) at {}",
+                                env.name,
+                                env.env_type,
+                                env.path.display()
+                            ),
+                            config.no_color,
                         );
                     }
                     return Some(env);
@@ -345,12 +434,15 @@ fn scan_all_venvs(config: &Config) -> Vec<Environment> {
         .collect();
 
     if config.verbose {
-        println!(
-            "[DEBUG] Scan complete. Found {} environments.",
-            environments.len()
+        print_debug(
+            &format!("Scan complete. Found {} environments.", environments.len()),
+            config.no_color,
         );
     } else {
-        println!("Scan complete. Checked {} files.", scan_count);
+        print_info(
+            &format!("Scan complete. Checked {} files.", scan_count),
+            config.no_color,
+        );
     }
 
     environments
@@ -396,53 +488,44 @@ fn detect_env_type(path: &Path) -> String {
     "unknown".to_string()
 }
 
-fn load_cache(cache_file: &Path, verbose: bool) -> io::Result<Vec<Environment>> {
-    if verbose {
-        println!("[DEBUG] Checking cache...");
+fn load_cache(cache_file: &Path, config: &Config) -> io::Result<Vec<Environment>> {
+    if config.verbose {
+        print_debug("Loading cache...", config.no_color);
     }
 
-    let file = File::open(cache_file)?;
-    let reader = BufReader::new(file);
-    let mut environments = Vec::new();
+    let contents = fs::read_to_string(cache_file)?;
+    let environments: Vec<Environment> = serde_json::from_str(&contents)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    for line in reader.lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() == 3 {
-            environments.push(Environment {
-                name: parts[0].to_string(),
-                env_type: parts[1].to_string(),
-                path: PathBuf::from(parts[2]),
-            });
-            if verbose {
-                println!("[DEBUG] Loaded from cache: {} ({})", parts[0], parts[1]);
-            }
-        }
+    if config.verbose {
+        print_debug(
+            &format!("Loaded {} environments from cache", environments.len()),
+            config.no_color,
+        );
     }
 
     Ok(environments)
 }
 
-fn save_cache(cache_file: &Path, environments: &[Environment], verbose: bool) -> io::Result<()> {
-    if verbose {
-        println!("[DEBUG] Saving cache to {}", cache_file.display());
-        println!(
-            "[DEBUG] Number of environments to save: {}",
-            environments.len()
+fn save_cache(cache_file: &Path, environments: &[Environment], config: &Config) -> io::Result<()> {
+    if config.verbose {
+        print_debug(
+            &format!("Saving cache to {}", cache_file.display()),
+            config.no_color,
+        );
+        print_debug(
+            &format!("Number of environments to save: {}", environments.len()),
+            config.no_color,
         );
     }
 
-    let mut file = File::create(cache_file)?;
-    for env in environments {
-        writeln!(file, "{}|{}|{}", env.name, env.env_type, env.path.display())?;
-        if verbose {
-            println!(
-                "[DEBUG] Saved: {} | {} | {}",
-                env.name,
-                env.env_type,
-                env.path.display()
-            );
-        }
+    let json = serde_json::to_string_pretty(environments)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    fs::write(cache_file, json)?;
+
+    if config.verbose {
+        print_debug("Cache saved successfully", config.no_color);
     }
 
     Ok(())
@@ -457,24 +540,30 @@ fn find_environment(
     // Try cache first
     if cache_file.exists() {
         if config.verbose {
-            println!("[DEBUG] Checking cache...");
+            print_debug("Checking cache...", config.no_color);
         }
-        if let Ok(environments) = load_cache(cache_file, config.verbose) {
+        if let Ok(environments) = load_cache(cache_file, config) {
             for env in environments {
                 if env.name.eq_ignore_ascii_case(env_name) {
                     let activate_script = env.path.join("Scripts").join("activate.bat");
                     if activate_script.exists() {
                         if config.verbose {
-                            println!(
-                                "[DEBUG] Found in cache: {} ({}) at {}",
-                                env.name,
-                                env.env_type,
-                                env.path.display()
+                            print_debug(
+                                &format!(
+                                    "Found in cache: {} ({}) at {}",
+                                    env.name,
+                                    env.env_type,
+                                    env.path.display()
+                                ),
+                                config.no_color,
                             );
                         }
                         return Some(env);
                     } else if config.verbose {
-                        println!("[DEBUG] Cached path no longer valid, searching directories...");
+                        print_debug(
+                            "Cached path no longer valid, searching directories...",
+                            config.no_color,
+                        );
                     }
                 }
             }
@@ -483,29 +572,35 @@ fn find_environment(
 
     // Search predefined directories
     if config.verbose {
-        println!("[DEBUG] Searching predefined directories...");
+        print_debug("Searching predefined directories...", config.no_color);
     }
 
     for dir in predefined_dirs {
         if !dir.exists() {
             if config.verbose {
-                println!("[DEBUG] Directory not found: \"{}\"", dir.display());
+                print_debug(
+                    &format!("Directory not found: \"{}\"", dir.display()),
+                    config.no_color,
+                );
             }
             continue;
         }
 
         if config.verbose {
-            println!("[DEBUG] Checking \"{}\"", dir.display());
+            print_debug(&format!("Checking \"{}\"", dir.display()), config.no_color);
         }
 
         let env_dir = dir.join(env_name);
         if env_dir.exists() {
             if let Some(env) = detect_environment_at_path(&env_dir) {
                 if config.verbose {
-                    println!(
-                        "[DEBUG] Found {} environment at: {}",
-                        env.env_type,
-                        env_dir.display()
+                    print_debug(
+                        &format!(
+                            "Found {} environment at: {}",
+                            env.env_type,
+                            env_dir.display()
+                        ),
+                        config.no_color,
                     );
                 }
                 return Some(env);
@@ -520,25 +615,40 @@ fn activate_environment(env: &Environment, config: &Config) {
     let activate_script = env.path.join("Scripts").join("activate.bat");
 
     if !activate_script.exists() {
-        eprintln!(
-            "Error: Activation script not found at \"{}\"",
-            activate_script.display()
+        print_error(
+            &format!(
+                "Activation script not found at \"{}\"",
+                activate_script.display()
+            ),
+            config.no_color,
         );
         return;
     }
 
     if config.verbose {
-        println!("[DEBUG] Activating: {}", env.path.display());
-        println!("[DEBUG] Type: {}", env.env_type);
-        println!("[DEBUG] Activation script: {}", activate_script.display());
+        print_debug(
+            &format!("Activating: {}", env.path.display()),
+            config.no_color,
+        );
+        print_debug(&format!("Type: {}", env.env_type), config.no_color);
+        print_debug(
+            &format!("Activation script: {}", activate_script.display()),
+            config.no_color,
+        );
         println!();
     }
 
-    println!("Activating \"{}\" ({})...", env.name, env.env_type);
+    print_success(
+        &format!("Activating \"{}\" ({})...", env.name, env.env_type),
+        config.no_color,
+    );
     println!();
-    println!(
-        "[{} activated - Type 'deactivate' or 'exit' to exit or close the window]",
-        env.name
+    print_info(
+        &format!(
+            "[{} activated - Type 'deactivate' or 'exit' to exit or close the window]",
+            env.name
+        ),
+        config.no_color,
     );
     println!();
 
@@ -549,7 +659,10 @@ fn activate_environment(env: &Environment, config: &Config) {
         .status();
 
     if let Err(e) = status {
-        eprintln!("Error: Failed to activate environment: {}", e);
+        print_error(
+            &format!("Failed to activate environment: {}", e),
+            config.no_color,
+        );
     }
 }
 
@@ -558,6 +671,46 @@ fn print_scan_results(environments: &[Environment]) {
         println!("  {}. {} ({})", i + 1, env.name, env.env_type);
         println!("     {}", env.path.display());
         println!();
+    }
+}
+
+fn print_error(msg: &str, no_color: bool) {
+    if no_color {
+        eprintln!("Error: {}", msg);
+    } else {
+        eprintln!("{} {}", "Error:".red().bold(), msg);
+    }
+}
+
+fn print_warning(msg: &str, no_color: bool) {
+    if no_color {
+        eprintln!("Warning: {}", msg);
+    } else {
+        eprintln!("{} {}", "Warning:".yellow().bold(), msg);
+    }
+}
+
+fn print_success(msg: &str, no_color: bool) {
+    if no_color {
+        println!("{}", msg);
+    } else {
+        println!("{}", msg.green());
+    }
+}
+
+fn print_info(msg: &str, no_color: bool) {
+    if no_color {
+        println!("{}", msg);
+    } else {
+        println!("{}", msg.cyan());
+    }
+}
+
+fn print_debug(msg: &str, no_color: bool) {
+    if no_color {
+        println!("[DEBUG] {}", msg);
+    } else {
+        println!("{}", format!("[DEBUG] {}", msg).dimmed());
     }
 }
 
@@ -575,15 +728,15 @@ fn show_help() {
     println!("  ape --scan [OPTIONS]");
     println!();
     println!("ARGUMENTS:");
-    println!(
-        "  env_name         Name of the environment to activate");
-    
+    println!("  env_name         Name of the environment to activate");
+
     println!();
     println!("OPTIONS:");
     println!("  -h, --help       Show this help message and exit");
     println!("  -v, --verbose    Enable verbose output (shows debug information)");
     println!("  -s, --scan       Perform comprehensive scan and update cache");
     println!("  -c, --clean      Remove the cache file and exit");
+    println!("  --no-color       Disable colored output");
     println!();
     println!("BEHAVIOR:");
     println!("  Searches for the specified environment using cached results (if available),");
@@ -601,7 +754,9 @@ fn show_help() {
     println!(
         "  - %USERPROFILE%\\AppData\\Local\\Programs (and its .venv, venv, .venvs, venvs subdirs)"
     );
-    println!("  - %USERPROFILE%\\AppData\\Local\\Programs\\Python (and its .venv, venv, .venvs, venvs subdirs)");
+    println!(
+        "  - %USERPROFILE%\\AppData\\Local\\Programs\\Python (and its .venv, venv, .venvs, venvs subdirs)"
+    );
     println!();
     println!("SUPPORTED ENVIRONMENT TYPES:");
     println!("  - venv   : Standard Python virtual environments");
@@ -619,10 +774,20 @@ fn show_help() {
     println!("  ape --help             Show this help message");
     println!();
     println!("CACHE:");
-    println!("  - Cache location: %TEMP%\\python_venv_cache.txt");
+    println!("  - Cache location: %TEMP%\\python_venv_cache.json");
     println!("  - Run 'ape --scan' after creating new venvs to update cache");
     println!("  - Delete cache file to force directory search");
     println!("  - Cache persists until manually deleted");
+    println!();
+    println!("CUSTOM DIRECTORIES:");
+    println!("  Create a config file at: %USERPROFILE%\\.config\\python_venv_config.toml");
+    println!();
+    println!("  Example config:");
+    println!("  directories = [");
+    println!("      \"%USERPROFILE%\\\\projects\",");
+    println!("      \"C:\\\\dev\\\\python\",");
+    println!("      \"%USERPROFILE%\\\\code\\\\.venvs\"");
+    println!("  ]");
     println!();
     println!("NOTES:");
     println!("  - Type 'deactivate' then 'exit' to close the activated shell");

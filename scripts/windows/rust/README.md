@@ -101,7 +101,7 @@ This installs both binaries to `%USERPROFILE%\.cargo\bin\` which should be in yo
 
 ## Usage
 
-The Rust versions have **identical** command-line interfaces to the batch scripts:
+The Rust versions have **nearly identical** command-line interfaces to the batch scripts, with some new options:
 
 ### APE Examples
 
@@ -125,6 +125,9 @@ ape --verbose myenv
 ape -v -s myenv
 ape -s -v myenv
 
+# Disable colored output
+ape --no-color myenv
+
 # Show help
 ape --help
 ape -h
@@ -147,6 +150,9 @@ spe --verbose
 
 # Scan with verbose output
 spe -s -v
+
+# Disable colored output
+spe --no-color
 
 # Show help
 spe --help
@@ -175,9 +181,9 @@ Both programs detect three types of Python environments:
 
 ### Cache Location
 
-Cache file: `%TEMP%\python_venv_cache.txt`
+Cache file: `%TEMP%\python_venv_cache.json`
 
-Format: `name|type|path` (pipe-delimited)
+Format: JSON with array of environment objects containing `name`, `env_type`, and `path` fields
 
 ### Searched Directories
 
@@ -191,6 +197,24 @@ When not using `--scan`, searches these predefined locations:
 - `%USERPROFILE%\AppData\Local\Programs\Python` (and its venv subdirectories)
 
 With `--scan`, recursively searches entire `%USERPROFILE%` directory (excluding `Temp`, `Cache`, `tmp`, and `node_modules`).
+
+## Configuration File
+
+To customize the directories searched by APE and SPE:
+
+1. Create the directory: `%USERPROFILE%\.config`
+2. Create file: `%USERPROFILE%\.config\python_venv_config.toml`
+3. Add your custom directories:
+
+```toml
+directories = [
+    "%USERPROFILE%\\my_projects",
+    "C:\\dev\\python",
+    "%USERPROFILE%\\code\\.venvs"
+]
+```
+
+See `python_venv_config.toml.example` for more details.
 
 ## Development
 
@@ -263,15 +287,70 @@ Or rename the batch scripts to `ape-old.bat` and `spe-old.bat` as backups.
 
 Possible improvements for the Rust version:
 
-- [ ] Parallel directory scanning (using `rayon`)
-- [ ] Better cache format (JSON, TOML, or binary)
+- [x] Parallel directory scanning (using `rayon`) - **IMPLEMENTED**
+- [x] Better cache format (JSON, TOML, or binary) - **IMPLEMENTED** (JSON)
 - [ ] Fuzzy matching for environment names
-- [ ] Color output support
+- [x] Color output support - **IMPLEMENTED**
 - [ ] Auto-completion support
 - [ ] Linux/Mac versions (using bash/zsh sourcing)
-- [ ] Configuration file support
-- [ ] Custom directory list
+- [x] Configuration file support - **IMPLEMENTED** (TOML)
+- [x] Custom directory list - **IMPLEMENTED**
 - [ ] Environment creation shortcuts
+
+## New Features (v1.0+)
+
+### JSON Cache Format
+
+The cache now uses JSON format (`python_venv_cache.json`) instead of plain text. This provides:
+- Better data structure support
+- Easier parsing and validation
+- Human-readable format for debugging
+
+The old cache file (`python_venv_cache.txt`) is no longer used. Run `ape --scan` or `spe --scan` to regenerate the cache in the new format.
+
+### Colored Output
+
+Both programs now support colored terminal output for better readability:
+- **Green** - Success messages (environments found, cache updated)
+- **Cyan** - Informational messages (scanning progress)
+- **Yellow** - Warnings (cache errors, unknown flags)
+- **Red** - Errors (environment not found, activation failures)
+- **Dimmed** - Debug output (verbose mode)
+
+To disable colors (e.g., for piping to files or terminals that don't support ANSI colors):
+```bash
+ape --no-color myenv
+spe --no-color
+```
+
+### Custom Directory Configuration
+
+You can now specify your own list of directories to search by creating a configuration file:
+
+**Location:** `%USERPROFILE%\.config\python_venv_config.toml`
+
+**Example configuration:**
+```toml
+# Custom directories to search for Python virtual environments
+directories = [
+    "%USERPROFILE%\\code",
+    "%USERPROFILE%\\projects",
+    "C:\\dev\\python",
+    "%USERPROFILE%\\.venvs"
+]
+```
+
+**Features:**
+- Use `%USERPROFILE%` placeholder for home directory
+- Use double backslashes (`\\`) for Windows paths
+- If the config file exists and has directories defined, these will be used **instead of** the default predefined directories
+- If no config file exists, falls back to default predefined directories
+- See `python_venv_config.toml.example` for a complete example
+
+**Benefits:**
+- Faster searches by limiting scope to your actual project locations
+- Support for non-standard directory structures
+- Easy to customize without recompiling
 
 ## License
 

@@ -1,0 +1,30 @@
+# Python Virtual Environment Configuration
+# Place this file at: %USERPROFILE%\.config\python_venv_config.toml
+
+# Custom directories to search for Python virtual environments
+# If this config file exists and has directories defined, these will be used
+# instead of the default predefined directories.
+#
+# You can use %USERPROFILE% as a placeholder for your home directory.
+# Use double backslashes (\\) for Windows paths.
+
+directories = [
+    # Your code projects
+    "%USERPROFILE%\\code",
+    "%USERPROFILE%\\code\\.venvs",
+    "%USERPROFILE%\\code\\python",
+
+    # Development folders
+    "%USERPROFILE%\\dev",
+    "%USERPROFILE%\\projects",
+
+    # Common venv locations
+    "%USERPROFILE%\\.venv",
+    "%USERPROFILE%\\venv",
+    "%USERPROFILE%\\.venvs",
+    "%USERPROFILE%\\venvs",
+
+    # Absolute paths (if needed)
+    "C:\\dev\\python",
+    "D:\\projects",
+]
