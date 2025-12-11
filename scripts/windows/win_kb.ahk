@@ -4,7 +4,7 @@
 ; Super (Windows) + Q closes current window
 
 #Requires AutoHotkey v2.0
-SetCapsLockState "AlwaysOff"
+SetCapsLockState("AlwaysOff")
 
 capsUsed := false  ; tracks if any other key was pressed while CapsLock held
 
