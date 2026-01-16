@@ -14,11 +14,11 @@ theme = Gruvbox Dark
 
 # Font settings
 font-family = "CaskaydiaCove Nerd Font Mono"
-font-size = 22.0
+font-size = 14.0
 
 # Window behavior
 background-opacity = 0.80  
-window-decoration = "none"   
+# window-decoration = "none"   
 
 # fullscreen = true
 # maximize = true
