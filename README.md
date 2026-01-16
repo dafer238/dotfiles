@@ -1,18 +1,38 @@
 # Installation
 
-### Clone the dotfiles
+## Quick Setup
+
+After cloning, run the setup script for your OS to automatically symlink dotfiles to their locations.
+
+### Linux
+
 ```bash
 git clone --recurse-submodules https://github.com/dafer238/dotfiles.git ~/dev
+cd ~/dev
+bash setup.sh
 ```
-or with SSH privileges
+
+### Windows
+
+```bat
+git clone --recurse-submodules https://github.com/dafer238/dotfiles.git %USERPROFILE%\dev
+cd %USERPROFILE%\dev
+setup.bat
+```
+
+### SSH Clone (Linux)
 
 ```bash
 git clone --recurse-submodules git@github.com:dafer238/dotfiles.git ~/dev
+cd ~/dev
+bash setup.sh
 ```
 
-### Clone and link files, dependancies need to be installed manually
+---
+
+### Manual Linking (Linux only, if you prefer)
+
 ```bash
-git clone --recurse-submodules https://github.com/dafer238/dotfiles.git ~/dev
 ln -sfn ~/dev/configs/config ~/.config/ghostty/config
 ln -sfn ~/dev/configs/.zshrc ~/.zshrc
 ln -sfn ~/dev/configs/.tmux.conf ~/.tmux.conf
