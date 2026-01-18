@@ -141,11 +141,11 @@ IF EXIST "%DOTFILES_DIR%\zed" (
 REM nvim config
 echo DEBUG: Checking existence of "%DOTFILES_DIR%\nvim"
 IF EXIST "%DOTFILES_DIR%\nvim" (
-    IF NOT EXIST "%USERPROFILE%\.config" (
-        mkdir "%USERPROFILE%\.config"
+    IF NOT EXIST "%USERPROFILE%\AppData\Local" (
+        mkdir "%USERPROFILE%\AppData\Local"
     )
-    echo DEBUG: About to create junction "%DOTFILES_DIR%\nvim" to "%USERPROFILE%\.config\nvim"
-    call :symlink_dir_with_prompt "%DOTFILES_DIR%\nvim" "%USERPROFILE%\.config\nvim"
+    echo DEBUG: About to create junction "%DOTFILES_DIR%\nvim" to "%USERPROFILE%\AppData\Local\nvim"
+    call :symlink_dir_with_prompt "%DOTFILES_DIR%\nvim" "%USERPROFILE%\AppData\Local\nvim"
 ) ELSE (
     echo DEBUG: "%DOTFILES_DIR%\nvim" does not exist
 )
