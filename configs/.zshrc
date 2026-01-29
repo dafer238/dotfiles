@@ -36,6 +36,13 @@ if [[ -z "$TMUX" ]]; then
     fi
 fi
 
+# WSLg integration for Arch
+if [ -d /mnt/wslg/runtime-dir ]; then
+    export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+    export WAYLAND_DISPLAY=wayland-0
+    export DISPLAY=:0
+fi
+
 # Function to activate a virtual environment from ~/code/python/venvs
 ape() {
   local venv_path=~/code/python/venvs/$1
