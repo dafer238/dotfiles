@@ -55,3 +55,5 @@ ape() {
 
 # Always start in the home directory
 cd ~
+
+. "$HOME/.local/bin/env"
