@@ -5,7 +5,7 @@ echo "[*] Installing base packages..."
 sudo apt update && sudo apt upgrade -y
 
 sudo apt install -y build-essential git curl wget unzip zip sudo openssh-client \
-    default-jdk fzf ripgrep zsh tmux clang gcc
+    default-jdk fzf ripgrep zsh tmux clang gcc lua5.4
 
 # lazygit (not in standard apt repos)
 if ! command -v lazygit &>/dev/null; then
