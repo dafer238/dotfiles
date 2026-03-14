@@ -17,7 +17,7 @@ eval "$(starship init zsh)"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 # Automatically attach to an unattached session, or create a new one
-if [[ -z "$TMUX" ]]; then
+if [[ -z "$TMUX" ]] && [[ -t 0 ]] && [[ -t 1 ]]; then
     # Look for an existing session that has no clients attached
     unattached=$(tmux ls -F "#{session_name} #{session_attached}" 2>/dev/null \
         | awk '$2 == 0 { print $1 }' | tail -n1)
