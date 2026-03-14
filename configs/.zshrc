@@ -3,7 +3,7 @@ export ZSH="$HOME/.oh-my-zsh"
 
 export LANG=en_US.UTF-8
 export LC_ALL=
-    
+
 # Enable plugins
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 
@@ -14,25 +14,26 @@ source $ZSH/oh-my-zsh.sh
 eval "$(starship init zsh)"
 
 # Add cargo to path
-# source "$HOME/.cargo/env"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Automatically attach to the last session or create a new one
+# Automatically attach to an unattached session, or create a new one
 if [[ -z "$TMUX" ]]; then
-    # Check for existing sessions
-    if tmux ls &>/dev/null; then
-        # Attach to the last session
-        tmux attach -t $(tmux ls -F "#{session_name}" | tail -n1)
-    else
-        # Create a new "dev" session with specific windows
+    # Look for an existing session that has no clients attached
+    unattached=$(tmux ls -F "#{session_name} #{session_attached}" 2>/dev/null \
+        | awk '$2 == 0 { print $1 }' | tail -n1)
+
+    if [[ -n "$unattached" ]]; then
+        # A previously-closed terminal left a session behind — resume it
+        exec tmux attach -t "$unattached"
+    elif ! tmux ls &>/dev/null; then
+        # No sessions exist at all — bootstrap the initial dev layout
         tmux new-session -d -s dev
-
-        # Create second window for Neovim
         tmux new-window -t dev:2
-
-        # Attach to the first window
         tmux select-window -t dev:1
-        tmux attach -t dev
+        exec tmux attach -t dev
+    else
+        # Every session already has a client — open a fresh independent session
+        exec tmux new-session
     fi
 fi
 
@@ -53,7 +54,7 @@ ape() {
   fi
 }
 
+[[ -f "$HOME/.local/bin/env" ]] && . "$HOME/.local/bin/env"
+
 # Always start in the home directory
 cd ~
-
-. "$HOME/.local/bin/env"
