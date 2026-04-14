@@ -15,8 +15,8 @@ bash setup.sh
 ### Windows
 
 ```bat
-git clone --recurse-submodules https://github.com/dafer238/dotfiles.git ~\dev
-cd ~\dev
+git clone --recurse-submodules https://github.com/dafer238/dotfiles.git $HOME/dev
+cd $HOME/dev
 setup.bat
 ```
 
