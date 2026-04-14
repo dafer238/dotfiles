@@ -2,6 +2,14 @@
 
 This directory contains Rust implementations of the `ape.bat` and `spe.bat` scripts for managing Python virtual environments on Windows.
 
+## Architecture
+
+The tools use a **core binary + shell wrapper** architecture to activate virtual environments in your **current shell session** (no nested shells):
+
+- **`ape-core.exe` / `spe-core.exe`** — Rust binaries that handle searching, scanning, caching, and writing the venv path to a temp marker file
+- **`ape.cmd` / `spe.cmd`** — CMD wrappers that call the core binary and run `call activate.bat` in the current CMD session
+- **`Invoke-PythonVenv.ps1`** — PowerShell functions that call the core binary and dot-source `Activate.ps1` in the current pwsh session
+
 ## Features
 
 Both programs replicate **all** functionality from the original batch scripts:
@@ -14,7 +22,7 @@ Both programs replicate **all** functionality from the original batch scripts:
 - ✅ Cache management for fast lookups
 - ✅ Support for venv, conda, and uv environments
 - ✅ Unknown flag detection with helpful warnings
-- ✅ Opens new cmd window with activated environment
+- ✅ **Activates in current shell** (CMD and PowerShell) — no nested terminals
 - ✅ Search predefined directories or entire user folder
 - ✅ All original help text and error messages
 
@@ -25,6 +33,7 @@ Both programs replicate **all** functionality from the original batch scripts:
 - ✅ Verbose mode and scan mode
 - ✅ Cache management
 - ✅ Formatted table output
+- ✅ **Activates in current shell** (CMD and PowerShell) — no nested terminals
 - ✅ Type 'Q' to quit
 - ✅ All original functionality preserved
 
@@ -51,17 +60,17 @@ The Rust versions offer significant performance improvements:
 ### Build Both Programs
 
 ```bash
-cd C:\Users\0206100\AppData\Local\Programs\Scripts\rust-versions
+cd C:\Users\0206100\dev\scripts\windows\rust
 
-# Build both APE and SPE (single command)
+# Build both APE-CORE and SPE-CORE (single command)
 cargo build --release
 ```
 
 The compiled binaries will be at:
 
 ```
-target\release\ape.exe
-target\release\spe.exe
+target\release\ape-core.exe
+target\release\spe-core.exe
 ```
 
 ## Installation
@@ -69,39 +78,34 @@ target\release\spe.exe
 ### Option 1: Copy to Scripts Directory (Recommended)
 
 ```bash
-# Copy compiled binaries to your Scripts folder
-copy target\release\ape.exe ..\ape.exe
-copy target\release\spe.exe ..\spe.exe
+# Copy compiled binaries and wrappers to your Scripts folder
+copy target\release\ape-core.exe ..\ape-core.exe
+copy target\release\spe-core.exe ..\spe-core.exe
+copy ape.cmd ..\ape.cmd
+copy spe.cmd ..\spe.cmd
+copy Invoke-PythonVenv.ps1 ..\Invoke-PythonVenv.ps1
 ```
 
-Now you can use `ape` and `spe` from anywhere (if the Scripts directory is in your PATH).
+For CMD: `ape` and `spe` work immediately (if the Scripts directory is in your PATH).
+
+For PowerShell: Add this line to your `$PROFILE`:
+```powershell
+. "C:\path\to\Scripts\Invoke-PythonVenv.ps1"
+```
 
 ### Option 2: Add to PATH
 
-Add the `target\release` directory to your PATH:
+Add the `target\release` directory to your PATH and copy the wrapper scripts there.
 
-1. Press Win + X, select "System"
-2. Click "Advanced system settings"
-3. Click "Environment Variables"
-4. Under "User variables", find "Path" and click "Edit"
-5. Click "New" and add:
-   ```
-   C:\Users\0206100\AppData\Local\Programs\Scripts\rust-versions\target\release
-   ```
+### Option 3: Use Build Script
 
-### Option 3: Use Cargo Install
-
-Install globally:
-
-```bash
-cargo install --path .
-```
-
-This installs both binaries to `%USERPROFILE%\.cargo\bin\` which should be in your PATH.
+Run `build.bat` which handles building, copying, and hard-link creation interactively.
 
 ## Usage
 
 The Rust versions have **nearly identical** command-line interfaces to the batch scripts, with some new options:
+
+> **Note:** Always invoke via the wrapper (`ape` / `spe`), not the core binary (`ape-core` / `spe-core`) directly, so the venv activates in your current shell.
 
 ### APE Examples
 
@@ -162,14 +166,23 @@ spe /?
 
 ## File Size Comparison
 
-| Program | Batch Script | Rust Binary (Release) |
-| ------- | ------------ | --------------------- |
-| ape     | 14 KB        | ~200 KB (stripped)    |
-| spe     | 12 KB        | ~200 KB (stripped)    |
+| Program    | Batch Script | Rust Binary (Release) |
+| ---------- | ------------ | --------------------- |
+| ape-core   | 14 KB        | ~750 KB (stripped)    |
+| spe-core   | 12 KB        | ~760 KB (stripped)    |
 
 While the Rust binaries are larger, they execute much faster and include all runtime dependencies.
 
 ## Technical Details
+
+### Activation Mechanism
+
+The core binaries (`ape-core.exe`, `spe-core.exe`) write the venv root path to a temp marker file (`%TEMP%\_venv_activate_path.txt`). Shell wrappers read this file and activate the environment in-process:
+
+- **CMD**: `ape.cmd` / `spe.cmd` use `call activate.bat`
+- **PowerShell**: `Invoke-PythonVenv.ps1` functions dot-source `Activate.ps1`
+
+This ensures the virtual environment is activated in your **current shell session** — no nested terminals.
 
 ### Environment Detection
 
@@ -231,13 +244,13 @@ cargo build
 ### Testing
 
 ```bash
-# Test ape
-target\debug\ape.exe --help
-target\debug\ape.exe -v -s
+# Test ape-core
+target\debug\ape-core.exe --help
+target\debug\ape-core.exe -v -s
 
-# Test spe
-target\debug\spe.exe --help
-target\debug\spe.exe -v
+# Test spe-core
+target\debug\spe-core.exe --help
+target\debug\spe-core.exe -v
 ```
 
 ## Troubleshooting
@@ -258,24 +271,31 @@ If you get errors about USERPROFILE not being set, the programs will fail gracef
 
 The programs look for `Scripts\activate.bat` in the environment directory. If you get this error, the environment might be corrupted or created on a non-Windows system.
 
+### Environment Not Activating (PowerShell)
+
+Make sure your `$PROFILE` dot-sources `Invoke-PythonVenv.ps1`:
+```powershell
+. "C:\path\to\Invoke-PythonVenv.ps1"
+```
+Without this, typing `ape` runs the `.exe` directly (which can't activate in your shell).
+
 ## Migration from Batch Scripts
 
 You can run the Rust versions alongside the batch scripts:
 
-1. Keep `ape.bat` and `spe.bat` as-is
-2. Name the Rust versions `ape.exe` and `spe.exe`
-3. Windows will prefer `.exe` over `.bat` when you type the command
-
-Or rename the batch scripts to `ape-old.bat` and `spe-old.bat` as backups.
+1. The Rust core binaries are named `ape-core.exe` and `spe-core.exe`
+2. The CMD wrappers (`ape.cmd`, `spe.cmd`) take precedence over `.bat` files
+3. Rename old batch scripts to `ape-old.bat` and `spe-old.bat` as backups
 
 ## Advantages of Rust Version
 
 1. **Speed** - 10-100x faster for scanning operations
-2. **Reliability** - Better error handling, no batch quirks
-3. **Memory efficiency** - More efficient data structures
-4. **Cross-platform potential** - Can be adapted for Linux/Mac with minimal changes
-5. **Type safety** - Compile-time error checking
-6. **Single executable** - No dependencies, no interpreter needed
+2. **In-shell activation** - Activates venv in current terminal (CMD and PowerShell)
+3. **Reliability** - Better error handling, no batch quirks
+4. **Memory efficiency** - More efficient data structures
+5. **Cross-platform potential** - Can be adapted for Linux/Mac with minimal changes
+6. **Type safety** - Compile-time error checking
+7. **Single executable** - No dependencies, no interpreter needed
 
 ## Disadvantages
 

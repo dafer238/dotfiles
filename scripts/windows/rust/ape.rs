@@ -5,7 +5,6 @@ use std::env;
 use std::fs::{self};
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use walkdir::WalkDir;
 
 const CACHE_FILENAME: &str = "python_venv_cache.json";
@@ -278,70 +277,10 @@ fn get_predefined_dirs() -> Vec<PathBuf> {
 
     vec![
         user_profile.clone(),
-        user_profile.join(".venv"),
-        user_profile.join("venv"),
-        user_profile.join(".venvs"),
-        user_profile.join("venvs"),
         user_profile.join("code"),
-        user_profile.join("code").join(".venv"),
-        user_profile.join("code").join("venv"),
-        user_profile.join("code").join(".venvs"),
-        user_profile.join("code").join("venvs"),
-        user_profile.join("code").join("python"),
-        user_profile.join("code").join("python").join(".venv"),
-        user_profile.join("code").join("python").join("venv"),
-        user_profile.join("code").join("python").join(".venvs"),
-        user_profile.join("code").join("python").join("venvs"),
+        user_profile.join("dev"),
+        user_profile.join("projects"),
         user_profile.join("AppData").join("Local").join("Programs"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join(".venv"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("venv"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join(".venvs"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("venvs"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Python"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Python")
-            .join(".venv"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Python")
-            .join("venv"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Python")
-            .join(".venvs"),
-        user_profile
-            .join("AppData")
-            .join("Local")
-            .join("Programs")
-            .join("Python")
-            .join("venvs"),
     ]
 }
 
@@ -570,10 +509,12 @@ fn find_environment(
         }
     }
 
-    // Search predefined directories
+    // Search predefined directories recursively
     if config.verbose {
         print_debug("Searching predefined directories...", config.no_color);
     }
+
+    const MAX_SEARCH_DEPTH: usize = 4;
 
     for dir in predefined_dirs {
         if !dir.exists() {
@@ -587,23 +528,47 @@ fn find_environment(
         }
 
         if config.verbose {
-            print_debug(&format!("Checking \"{}\"", dir.display()), config.no_color);
+            print_debug(&format!("Searching \"{}\" (depth {})...", dir.display(), MAX_SEARCH_DEPTH), config.no_color);
         }
 
-        let env_dir = dir.join(env_name);
-        if env_dir.exists() {
-            if let Some(env) = detect_environment_at_path(&env_dir) {
-                if config.verbose {
-                    print_debug(
-                        &format!(
-                            "Found {} environment at: {}",
-                            env.env_type,
-                            env_dir.display()
-                        ),
-                        config.no_color,
-                    );
+        for entry in WalkDir::new(dir)
+            .max_depth(MAX_SEARCH_DEPTH)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                if let Some(name) = e.file_name().to_str() {
+                    let n = name.to_lowercase();
+                    !n.contains("temp") && !n.contains("cache") && !n.contains("tmp")
+                        && name != "node_modules" && name != "$RECYCLE.BIN"
+                        && name != "System Volume Information"
+                } else {
+                    true
                 }
-                return Some(env);
+            })
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.path().file_name() {
+                if name.to_string_lossy().eq_ignore_ascii_case(env_name) {
+                    if let Some(env) = detect_environment_at_path(entry.path()) {
+                        if config.verbose {
+                            print_debug(
+                                &format!(
+                                    "Found {} environment at: {}",
+                                    env.env_type,
+                                    entry.path().display()
+                                ),
+                                config.no_color,
+                            );
+                        }
+                        return Some(env);
+                    }
+                }
             }
         }
     }
@@ -643,27 +608,32 @@ fn activate_environment(env: &Environment, config: &Config) {
         config.no_color,
     );
     println!();
+
+    // Write venv path to marker file for shell wrapper to pick up
+    let marker_file = env::temp_dir().join("_venv_activate_path.txt");
+    if let Err(e) = fs::write(&marker_file, env.path.to_string_lossy().as_ref()) {
+        print_error(
+            &format!("Failed to write activation marker file: {}", e),
+            config.no_color,
+        );
+        return;
+    }
+
+    if config.verbose {
+        print_debug(
+            &format!("Wrote activation path to: {}", marker_file.display()),
+            config.no_color,
+        );
+    }
+
     print_info(
         &format!(
-            "[{} activated - Type 'deactivate' or 'exit' to exit or close the window]",
+            "[{} ready - Type 'deactivate' to deactivate the environment]",
             env.name
         ),
         config.no_color,
     );
     println!();
-
-    // Launch new cmd window with environment activated
-    let status = Command::new("cmd")
-        .arg("/k")
-        .arg(activate_script.to_string_lossy().to_string())
-        .status();
-
-    if let Err(e) = status {
-        print_error(
-            &format!("Failed to activate environment: {}", e),
-            config.no_color,
-        );
-    }
 }
 
 fn print_scan_results(environments: &[Environment]) {
@@ -743,20 +713,16 @@ fn show_help() {
     println!("  or searches predefined directories. With --scan, performs a comprehensive");
     println!("  search of your entire user folder and updates the persistent cache.");
     println!();
-    println!("  Opens a new command prompt with the environment activated. The environment");
-    println!("  stays active until you close the window or type 'deactivate' or 'exit'.");
+    println!("  Activates the environment in your current shell session (CMD or PowerShell).");
+    println!("  Type 'deactivate' to return to normal.");
     println!();
     println!("SEARCHED DIRECTORIES:");
+    println!("  Each directory is searched recursively (up to 4 levels deep):");
     println!("  - %USERPROFILE%");
-    println!("  - %USERPROFILE%\\.venv, \\venv, \\.venvs, \\venvs");
-    println!("  - %USERPROFILE%\\code (and its .venv, venv, .venvs, venvs subdirs)");
-    println!("  - %USERPROFILE%\\code\\python (and its .venv, venv, .venvs, venvs subdirs)");
-    println!(
-        "  - %USERPROFILE%\\AppData\\Local\\Programs (and its .venv, venv, .venvs, venvs subdirs)"
-    );
-    println!(
-        "  - %USERPROFILE%\\AppData\\Local\\Programs\\Python (and its .venv, venv, .venvs, venvs subdirs)"
-    );
+    println!("  - %USERPROFILE%\\code");
+    println!("  - %USERPROFILE%\\dev");
+    println!("  - %USERPROFILE%\\projects");
+    println!("  - %USERPROFILE%\\AppData\\Local\\Programs");
     println!();
     println!("SUPPORTED ENVIRONMENT TYPES:");
     println!("  - venv   : Standard Python virtual environments");
@@ -790,9 +756,9 @@ fn show_help() {
     println!("  ]");
     println!();
     println!("NOTES:");
-    println!("  - Type 'deactivate' then 'exit' to close the activated shell");
+    println!("  - Type 'deactivate' to deactivate the environment");
     println!("  - Use 'spe' to interactively browse all available environments");
     println!("  - First time use: Run 'ape --scan' to build the cache for faster searches");
-    println!("  - Both 'ape' and 'spe' open new shells with the environment activated");
+    println!("  - Requires shell wrappers (ape.cmd for CMD, PowerShell function for pwsh)");
     println!();
 }

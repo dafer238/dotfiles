@@ -6,11 +6,11 @@ authors = ["dafer"]
 description = "Python virtual environment management tools - APE and SPE"
 
 [[bin]]
-name = "ape"
+name = "ape-core"
 path = "ape.rs"
 
 [[bin]]
-name = "spe"
+name = "spe-core"
 path = "spe.rs"
 
 [dependencies]
