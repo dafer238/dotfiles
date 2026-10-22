@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# library.sh - interactive Google Drive <-> local library sync (books, papers, sioyek annotations)
+# library.sh - interactive Google Drive <-> local library sync (books, papers, sioyek and KOReader annotations)
 #
 #   library               interactive menu (vim keys: j/k move, enter/l open, h/esc back, q quit)
 #   library status        print sync status and exit
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.2.0
+VERSION=1.3.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -20,6 +20,8 @@ STATE_FILE=$CFG_DIR/state
 FILTER_FILE=$CFG_DIR/filters.rclone
 MANIFEST_FILE=$CFG_DIR/manifest
 ANNOT_DIR=sioyek
+KO_DIR=koreader
+KO_STATE=$CFG_DIR/koreader-state
 MARKER_DIR=.library-sync
 COMMON_EXTS=(pdf epub djvu mobi azw3 cbz cbr fb2 txt md)
 MIN_RCLONE_MINOR=60
@@ -52,10 +54,13 @@ CHECKERS=8
 TPSLIMIT=10
 BWLIMIT=
 SIOYEK_ASKED=0
+KOREADER_DIR=
+KO_CONFLICT=newer
+KO_POLICY=newer KO_ALL=
 LAST_PULL= LAST_PUSH= LAST_MERGE=
 DIFF_READY=0
 REMOTE_MISSING=0
-declare -A CNT=() MENU_POS=() DIRCACHE=()
+declare -A CNT=() MENU_POS=() DIRCACHE=() KS_LIVE=() KS_STAGE=() KS_MARK=()
 LIST_DIR= LIST_AT=0 LIST_SIG=
 LIST_PIDS=()
 
@@ -206,6 +211,8 @@ apply_kv() {
     TRANSFERS | CHECKERS | TPSLIMIT) [[ $v =~ ^[0-9]{1,3}$ ]] && printf -v "$k" '%s' "$v" ;;
     BWLIMIT) [[ $v =~ ^[0-9A-Za-z.:,\ -]*$ ]] && BWLIMIT=$v ;;
     SIOYEK_ASKED) [[ $v == 1 ]] && SIOYEK_ASKED=1 ;;
+    KOREADER_DIR) [[ -z $v || $v == /* ]] && KOREADER_DIR=$v ;;
+    KO_CONFLICT) [[ $v =~ ^(newer|local|remote|ask)$ ]] && KO_CONFLICT=$v ;;
     LAST_PULL | LAST_PUSH | LAST_MERGE) [[ $v =~ ^[0-9T:+.-]*$ ]] && printf -v "$k" '%s' "$v" ;;
   esac
 }
@@ -245,6 +252,8 @@ CHECKERS=$CHECKERS
 TPSLIMIT=$TPSLIMIT
 BWLIMIT=$BWLIMIT
 SIOYEK_ASKED=$SIOYEK_ASKED
+KOREADER_DIR=$KOREADER_DIR
+KO_CONFLICT=$KO_CONFLICT
 EOF
 }
 
@@ -286,6 +295,8 @@ build_filters() {
       ef=$(glob_escape "$f")
       if [[ $f == "$ANNOT_DIR" || $f == "$ANNOT_DIR"/* ]]; then
         printf '%s\n' "- /$ef/**.db-journal" "- /$ef/**.db-wal" "- /$ef/**.db-shm" "+ /$ef/**"
+      elif [[ $f == "$KO_DIR" || $f == "$KO_DIR"/* ]]; then
+        printf '%s\n' "- /$ef/**.old" "- /$ef/**.tmp" "+ /$ef/**"
       elif ((use_types)) && [[ $FILTER_MODE == exclude ]]; then
         for e in "${FILTER_EXT[@]}"; do say "- /$ef/**.$e"; done
         say "+ /$ef/**"
@@ -373,7 +384,9 @@ prefetch() {
   ((DIFF_READY)) && return 0
   ((${#FOLDERS[@]})) && have rclone || return 0
   [[ -n $LIST_DIR ]] && (($(date +%s) - LIST_AT < 60)) && return 0
-  build_filters && start_listings "$TMP/ls.$RANDOM$RANDOM"
+  build_filters || return 0
+  koreader_import quiet
+  start_listings "$TMP/ls.$RANDOM$RANDOM"
 }
 
 compute_diff() {
@@ -381,8 +394,11 @@ compute_diff() {
   DIFF_READY=0 REMOTE_MISSING=0
   build_filters || return 1
   if [[ -z $LIST_DIR ]] || (($(date +%s) - LIST_AT > 120)) || [[ $LIST_SIG != "$(list_sig)" ]]; then
+    koreader_import
     printf '%sListing %s and %s …%s\n' "$CD" "$(tildify "$LIBRARY_ROOT")" "$(rpath)" "$C0"
     start_listings "$TMP/ls.$RANDOM$RANDOM"
+  else
+    ko_ready >/dev/null  # the prefetch imported quietly: still say why KOReader isn't synced, if it isn't
   fi
   wait "${LIST_PIDS[@]}" 2>/dev/null
   d=$LIST_DIR LIST_DIR=
@@ -461,7 +477,7 @@ apply_renames() {
   done <"$TMP/renames"
 }
 
-set_last() { printf -v "LAST_${1^^}" '%s' "$(now_iso)"; save_state; save_manifest; save_sioyek_base; write_marker; }
+set_last() { printf -v "LAST_${1^^}" '%s' "$(now_iso)"; save_state; save_manifest; save_sioyek_base; save_koreader_base; write_marker; }
 
 devices_lines() {
   local h pu pl mark lp
@@ -717,9 +733,11 @@ run_rclone() { # LOGFILE ARGS...
 
 # do_sync pull|push|merge [assume_yes] [force]
 do_sync() {
-  local op=$1 yes=${2:-0} force=${3:-0} a b c d over del dest_n ts log rc=0 title ren unk revert names=b merge_db=0
+  local op=$1 yes=${2:-0} force=${3:-0} a b c d over del dest_n ts log rc=0 title ren unk revert names=b merge_db=0 ko_n=0 ko_new=0
   [[ $DIFF_READY == 1 ]] || compute_diff || return 1
   [[ $op != push ]] && annot_db_changed && merge_db=1
+  [[ $op != push ]] && read -r ko_n ko_new < <(ko_pending "$op")
+  KO_POLICY=$KO_CONFLICT KO_ALL=
   ren=${CNT[ren]}
   unk=$(awk -F'\t' '$3 == ""' "$TMP/renames" | wc -l)
   case $op in
@@ -728,7 +746,7 @@ do_sync() {
     *) revert=0 ;;
   esac
   case $op in
-    pull)  a=${CNT[radd]} b=$((CNT[rnew] + CNT[size])) over=${CNT[lnew]} del=${CNT[ladd]} dest_n=$LOCAL_N
+    pull)  a=${CNT[radd]} b=$((CNT[rnew] + CNT[size])) over=${CNT[lnew]} del=$((CNT[ladd] - ko_new)) dest_n=$LOCAL_N
            title="Pull  $(rpath) → $(tildify "$LIBRARY_ROOT")" ;;
     push)  a=${CNT[ladd]} b=$((CNT[lnew] + CNT[size])) over=${CNT[rnew]} del=${CNT[radd]} dest_n=$REMOTE_N
            title="Push  $(tildify "$LIBRARY_ROOT") → $(rpath)" ;;
@@ -759,7 +777,10 @@ do_sync() {
       ((del)) && printf '   %s✘ %5d%s  files missing from the source will be removed (moved to trash)\n' "$CR" "$del" "$C0"
     fi
     ((merge_db)) && have sqlite3 && printf '   %s⇄      %s  sioyek annotations from both sides are merged, not overwritten\n' "$CBL" "$C0"
-    if ((a + b + over + del + ren == 0)); then
+    ((ko_n)) && printf '   %s⇄ %5d%s  KOReader books changed here are merged with the remote copy; conflicts: %s%s%s  %s(c to change)%s\n' \
+      "$CBL" "$ko_n" "$C0" "$CB" "$(ko_policy_desc "$KO_POLICY")" "$C0" "$CD" "$C0"
+    ((ko_new)) && printf '   %s↑ %5d%s  KOReader books first opened here are uploaded, not removed\n' "$CY" "$ko_new" "$C0"
+    if ((a + b + over + del + ren + ko_new == 0)); then
       ok "Already in sync - nothing to $op."
       set_last "$op"
       return 0
@@ -776,9 +797,12 @@ do_sync() {
       y | Y) say; break ;;
       v) view_diff changes ;;
       l | r | b) [[ $op == merge ]] && ((unk)) && names=$KEY || { say; info "Cancelled."; return 1; } ;;
+      c) ((ko_n)) && KO_POLICY=$(ko_next_policy "$KO_POLICY") || { say; info "Cancelled."; return 1; } ;;
       *) say; info "Cancelled."; return 1 ;;
     esac
   done
+  # Nobody to ask: the newer edit wins.
+  [[ $KO_POLICY == ask ]] && { ((yes || !TTY)) || [[ ! -t 0 ]]; } && KO_POLICY=newer
   # Guard against mass deletion (e.g. pushing from an empty or wrongly-configured device).
   if ((del >= 10 && del * 4 > dest_n)); then
     warn "This would remove $del of $dest_n files on the destination."
@@ -811,6 +835,11 @@ do_sync() {
     err "${op^} cancelled, so neither annotation database gets overwritten."
     return 1
   fi
+  if [[ $op != push ]] && ! koreader_merge "$op" "$LIBRARY_ROOT/.trash/$ts" "$REMOTE:$REMOTE_TRASH/$ts"; then
+    DIFF_READY=0
+    err "${op^} cancelled."
+    return 1
+  fi
   case $op in
     pull) run_rclone "$log" sync "${X[@]}" --track-renames --backup-dir "$LIBRARY_ROOT/.trash/$ts" -- "$(rpath)" "$LIBRARY_ROOT"; rc=$? ;;
     push) run_rclone "$log" sync "${X[@]}" --track-renames --backup-dir "$REMOTE:$REMOTE_TRASH/$ts" -- "$LIBRARY_ROOT" "$(rpath)"; rc=$? ;;
@@ -830,6 +859,8 @@ do_sync() {
     err "${op^} failed (rclone exit $rc). Last errors from $(tildify "$log"):"
     rclone_error "$log"
   fi
+  # Whatever did arrive is complete (rclone writes each file whole), so KOReader gets it either way.
+  koreader_export
   return $rc
 }
 
@@ -936,7 +967,7 @@ filters_menu() {
   cursor off
   while :; do
     n=${#list[@]}
-    buf=" ${CB}File-type filter for this device${C0}  ${CD}(sioyek annotations are always synced)${C0}"$'\n\n'
+    buf=" ${CB}File-type filter for this device${C0}  ${CD}(sioyek and KOReader annotations are always synced)${C0}"$'\n\n'
     buf+=" mode: "
     for e in none exclude include; do
       local lbl=$e; [[ $e == none ]] && lbl="sync everything"; [[ $e == exclude ]] && lbl="exclude selected"; [[ $e == include ]] && lbl="only selected"
@@ -1335,6 +1366,682 @@ sioyek_setup() {
   pause
 }
 
+# ------------------------------------------------------------- koreader --
+# KOReader keeps each book's highlights, notes, bookmarks and reading position in a metadata file.
+# Set to its hash-based folder (koreader/hashdocsettings/<xx>/<partial md5>.sdr/), these files are
+# named by the book's content, so they match on every device, like sioyek's database. Before every
+# listing, what KOReader changed is copied into $KO_DIR/ in the library (the synced copy); after
+# every sync, what the sync changed is copied back. On Pull and Merge, files changed on both sides
+# are merged by the Lua program below.
+#
+# koreader-state (KS_*) remembers per file what was last copied either way: the MD5 of KOReader's
+# file, the MD5 of the synced copy it matched, and the marker last written into KOReader's file.
+# KOReader keeps unknown keys, so a file it saves still carries the marker it was loaded with: a
+# different one means it was saved from a book left open since before the last sync, and is merged
+# in rather than copied over newer data.
+read -r -d '' KO_LUA <<'EOF'
+-- komerge.lua - KOReader book-metadata helper for library.sh (Lua 5.1-5.4 / LuaJIT)
+--   canon IN OUT HEADER         rewrite a sidecar canonically without this device's flags; prints its marker or -
+--   stamp IN OUT HEADER MARKER  write a synced sidecar into KOReader's folder, tagged with MARKER and
+--                               keeping the layout settings OUT already has on this device
+--   merge OUT HEADER L R B LTIME RTIME POLICY [ANSWERS]
+--                               three-way merge of L (here) and R (remote) given B (last sync, "-" = none);
+--                               POLICY newer|local|remote|ask. With ask and no ANSWERS the conflicts are
+--                               printed (id TAB what TAB here TAB remote) and the exit status is 3.
+--   get IN KEY                  print a top-level value (reads settings.reader.lua)
+-- Files are written the way KOReader's dump() writes them, so unchanged data gives identical bytes.
+
+local MARK, FLAG = "library_sync", "annotations_externally_modified"
+-- Reading progress and book status follow the reader from device to device; every other key
+-- (fonts, margins, zoom, page counts, statistics) stays as each device has it.
+local SYNCED = { last_xpointer = true, last_epubcfi = true, last_page = true, page_positions = true,
+  percent_finished = true, summary = true }
+-- Recomputed by KOReader from each device's layout, so they are ignored when comparing annotations.
+local DERIVED = { pageno = true, pageref = true }
+
+local function fail(msg) io.stderr:write("komerge: ", tostring(msg), "\n"); os.exit(1) end
+
+local function read_table(path)
+  local f = io.open(path, "rb")
+  if not f then return nil, "cannot read " .. path end
+  local s = f:read("*a"); f:close()
+  if s:byte(1) == 27 then return nil, path .. ": precompiled chunk refused" end
+  -- No globals: the file can build its table and nothing else.
+  local fn, err
+  if setfenv then
+    fn, err = loadstring(s, "=" .. path)
+    if fn then setfenv(fn, {}) end
+  else
+    fn, err = load(s, "=" .. path, "t", {})
+  end
+  if not fn then return nil, err end
+  local ok, t = pcall(fn)
+  if not ok then return nil, tostring(t) end
+  if type(t) ~= "table" then return nil, path .. ": not a KOReader metadata file" end
+  return t
+end
+
+local function load_table(path)
+  local t, err = read_table(path)
+  if not t then fail(err) end
+  return t
+end
+
+local function num(n) return string.format("%.14g", n) end -- LuaJIT's tostring() for numbers
+
+-- string.format("%q") as LuaJIT does it: control characters as decimal escapes.
+local function quote(s)
+  return '"' .. s:gsub('([%c"\\])(%d?)', function(c, d)
+    local b = c:byte()
+    if b == 34 or b == 92 or b == 10 then return "\\" .. c .. d end
+    if b >= 100 or d ~= "" then return string.format("\\%03d", b) .. d end
+    return "\\" .. b .. d
+  end) .. '"'
+end
+
+local function key_str(k) return type(k) == "number" and num(k) or tostring(k) end
+
+local function sorted_keys(t)
+  local ks = {}
+  for k in pairs(t) do ks[#ks + 1] = k end
+  table.sort(ks, function(a, b)
+    local ta, tb = type(a), type(b)
+    if ta == tb and (ta == "number" or ta == "string") then return a < b end
+    return key_str(a) < key_str(b)
+  end)
+  return ks
+end
+
+local function dump(v, indent, out)
+  local t = type(v)
+  if t == "table" then
+    local ks = sorted_keys(v)
+    out[#out + 1] = "{"
+    for _, k in ipairs(ks) do
+      out[#out + 1] = "\n" .. string.rep("    ", indent + 1) .. "["
+      dump(k, indent + 1, out)
+      out[#out + 1] = "] = "
+      dump(v[k], indent + 1, out)
+      out[#out + 1] = ","
+    end
+    if #ks > 0 then out[#out + 1] = "\n" .. string.rep("    ", indent) end
+    out[#out + 1] = "}"
+  elseif t == "string" then out[#out + 1] = quote(v)
+  elseif t == "number" then out[#out + 1] = num(v)
+  elseif t == "boolean" then out[#out + 1] = tostring(v)
+  else out[#out + 1] = "nil" end
+end
+
+local function write_table(path, header, t)
+  local out = { header, "\nreturn " }
+  dump(t, 0, out)
+  out[#out + 1] = "\n"
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "wb")
+  if not f then fail("cannot write " .. path) end
+  f:write(table.concat(out)); f:close()
+  local ok, err = os.rename(tmp, path) -- atomic: KOReader never sees a half-written file
+  if not ok then fail(err) end
+end
+
+local function eq(a, b, skip)
+  if a == b then return true end
+  local ta, tb = type(a), type(b)
+  if ta == "number" and tb == "number" then return num(a) == num(b) end
+  if ta ~= "table" or tb ~= "table" then return false end
+  for k, v in pairs(a) do
+    if not (skip and skip[k]) and not eq(v, b[k]) then return false end
+  end
+  for k in pairs(b) do
+    if not (skip and skip[k]) and a[k] == nil then return false end
+  end
+  return true
+end
+
+-- ----------------------------------------------------------------- describe --
+local function clip(s, n)
+  s = tostring(s or ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+  if #s > n then s = s:sub(1, n):gsub("[\192-\255][\128-\191]*$", "") .. "…" end
+  return s
+end
+
+local function title_of(t)
+  local p = type(t.doc_props) == "table" and t.doc_props.title or type(t.stats) == "table" and t.stats.title
+  if type(p) == "string" and p ~= "" then return p end
+  return type(t.doc_path) == "string" and t.doc_path:match("[^/]*$") or "?"
+end
+
+local function where(a)
+  local p = a.pageno or (type(a.page) == "number" and a.page)
+  if p then return "p. " .. key_str(p) end
+  return a.chapter and clip(a.chapter, 30) or "?"
+end
+
+local function describe_ann(a)
+  local s = a.drawer and ('"' .. clip(a.text, 50) .. '"') or "bookmark"
+  if a.note and a.note ~= "" then s = s .. "  note: " .. clip(a.note, 50) end
+  if a.color then s = s .. "  " .. tostring(a.color) end
+  return s .. "  (" .. tostring(a.datetime_updated or a.datetime or "?") .. ")"
+end
+
+local function describe_progress(t)
+  local s = {}
+  if type(t.percent_finished) == "number" then s[#s + 1] = string.format("%.0f%%", t.percent_finished * 100) end
+  if type(t.last_page) == "number" then s[#s + 1] = "page " .. key_str(t.last_page) end
+  if type(t.summary) == "table" and t.summary.status then s[#s + 1] = tostring(t.summary.status) end
+  return #s > 0 and table.concat(s, ", ") or "-"
+end
+
+-- -------------------------------------------------------------------- merge --
+-- Annotations are matched the way KOReader's own import matches them: highlight or bookmark,
+-- same page and same start/end position.
+local function pos(p)
+  if type(p) == "table" then return key_str(p.page) .. ":" .. key_str(p.x) .. ":" .. key_str(p.y) end
+  return p == nil and "" or key_str(p)
+end
+
+local function index(list)
+  local map, order, seen = {}, {}, {}
+  for _, a in ipairs(type(list) == "table" and list or {}) do
+    if type(a) == "table" then
+      local k = (a.drawer and "h" or "b") .. "|" .. pos(a.page) .. "|" .. pos(a.pos0) .. "|" .. pos(a.pos1)
+      seen[k] = (seen[k] or 0) + 1
+      if seen[k] > 1 then k = k .. "#" .. seen[k] end
+      map[k] = a; order[#order + 1] = k
+    end
+  end
+  return map, order
+end
+
+local function stamp_of(a) return tostring(a.datetime_updated or a.datetime or "") end
+
+local function copy(t) local c = {}; for k, v in pairs(t) do c[k] = v end; return c end
+
+-- Keep both notes, in the newer version of the highlight.
+local function both(l, r)
+  local remote_newer = stamp_of(r) > stamp_of(l)
+  local c = copy(remote_newer and r or l)
+  if l.note and r.note and l.note ~= r.note then c.note = l.note .. "\n\n" .. r.note
+  else c.note = l.note or r.note end
+  c.datetime_updated = remote_newer and r.datetime_updated or l.datetime_updated
+  return c
+end
+
+local function merge(L, R, B, ltime, rtime, policy, answers, conflicts)
+  local has_base = B ~= nil
+  B = B or {}
+  local title = title_of(L)
+  local function decide(id, what, here, remote, l_newer)
+    local a = answers[id]
+    if policy == "ask" and not a then
+      conflicts[#conflicts + 1] = table.concat({ id, title .. " · " .. what, here, remote }, "\t")
+    end
+    a = a or policy
+    if a == "l" or a == "local" then return "l" end
+    if a == "r" or a == "remote" then return "r" end
+    if a == "b" then return "b" end
+    return l_newer and "l" or "r"
+  end
+
+  local out = {}
+  -- Annotations, one by one.
+  if L.annotations ~= nil or R.annotations ~= nil then
+    local lm, lo = index(L.annotations)
+    local rm, ro = index(R.annotations)
+    local bm = index(B.annotations)
+    local list = {}
+    for _, k in ipairs(lo) do
+      local l, r, b = lm[k], rm[k], has_base and bm[k] or nil
+      local keep = l
+      if r then
+        if eq(l, r, DERIVED) or (b and eq(r, b, DERIVED)) then keep = l
+        elseif b and eq(l, b, DERIVED) then keep = r
+        else
+          local c = decide("a:" .. k, where(l), describe_ann(l), describe_ann(r), stamp_of(l) >= stamp_of(r))
+          keep = c == "b" and both(l, r) or c == "r" and r or l
+        end
+      elseif b and eq(l, b, DERIVED) then
+        keep = nil -- deleted on the remote; kept when it was also edited here
+      end
+      if keep then list[#list + 1] = keep end
+    end
+    for _, k in ipairs(ro) do
+      if lm[k] == nil and not (has_base and bm[k] and eq(rm[k], bm[k], DERIVED)) then
+        list[#list + 1] = rm[k] -- new on the remote (or edited there and deleted here)
+      end
+    end
+    out.annotations = list
+  end
+
+  -- Progress and status: three-way per key; conflicting keys are settled together.
+  local pending = {}
+  for _, t in ipairs({ L, R }) do
+    for k in pairs(t) do
+      if SYNCED[k] and out[k] == nil and pending[k] == nil then
+        local l, r, b = L[k], R[k], B[k]
+        if eq(l, r) or (has_base and eq(r, b)) or (not has_base and r == nil) then out[k] = l
+        elseif (has_base and eq(l, b)) or (not has_base and l == nil) then out[k] = r
+        else pending[k] = true end
+      end
+    end
+  end
+  if next(pending) then
+    local c = decide("progress", "reading position and status",
+      describe_progress(L), describe_progress(R), ltime >= rtime)
+    for k in pairs(pending) do out[k] = (c == "r" and R or L)[k] end
+  end
+
+  -- Everything else is this device's; the remote fills in only what this device lacks.
+  for _, t in ipairs({ L, R }) do
+    for k, v in pairs(t) do
+      if k ~= "annotations" and not SYNCED[k] and k ~= MARK and k ~= FLAG and out[k] == nil then out[k] = v end
+    end
+  end
+  return out
+end
+
+-- --------------------------------------------------------------------- main --
+local mode = arg[1]
+if mode == "canon" then
+  local t = load_table(arg[2])
+  local m = t[MARK]
+  t[MARK], t[FLAG] = nil, nil
+  write_table(arg[3], arg[4], t)
+  print(type(m) == "string" and m or "-")
+elseif mode == "stamp" then
+  local t = load_table(arg[2])
+  -- The synced copy carries the layout of whichever device synced it last; keep this device's.
+  local own = read_table(arg[3])
+  for k, v in pairs(own or {}) do
+    if k ~= "annotations" and not SYNCED[k] and k ~= MARK and k ~= FLAG then t[k] = v end
+  end
+  t[MARK] = arg[5]
+  -- Makes KOReader recompute page numbers and re-sort the annotations when it opens the book.
+  if type(t.annotations) == "table" and #t.annotations > 0 then t[FLAG] = true end
+  write_table(arg[3], arg[4], t)
+elseif mode == "merge" then
+  local out_path, header, policy = arg[2], arg[3], arg[9]
+  local L, R = load_table(arg[4]), load_table(arg[5])
+  local B = arg[6] ~= "-" and load_table(arg[6]) or nil
+  local answers = {}
+  if arg[10] then
+    local f = io.open(arg[10], "rb")
+    if f then
+      for line in f:lines() do
+        local id, a = line:match("^(.-)\t(.*)$")
+        if id then answers[id] = a end
+      end
+      f:close()
+    end
+  end
+  local conflicts = {}
+  local out = merge(L, R, B, arg[7] or "", arg[8] or "", policy, answers, conflicts)
+  if #conflicts > 0 then
+    for _, c in ipairs(conflicts) do print(c) end
+    os.exit(3)
+  end
+  write_table(out_path, header, out)
+elseif mode == "get" then
+  local v = load_table(arg[2])[arg[3]]
+  if type(v) == "string" or type(v) == "number" or type(v) == "boolean" then print(tostring(v)) end
+else
+  fail("usage: komerge.lua canon|stamp|merge|get ...")
+end
+EOF
+
+lua_bin() {
+  local b
+  for b in lua5.4 lua54 lua5.3 lua53 lua luajit lua5.2 lua5.1; do have "$b" && { printf '%s' "$b"; return 0; }; done
+  return 1
+}
+
+ko_lua() {
+  local l; l=$(lua_bin) || return 1
+  [[ -f $TMP/komerge.lua ]] || printf '%s\n' "$KO_LUA" >"$TMP/komerge.lua"
+  "$l" "$TMP/komerge.lua" "$@"
+}
+
+ko_synced() { [[ " ${FOLDERS[*]} " == *" $KO_DIR "* ]]; }
+ko_on() { [[ -n $KOREADER_DIR ]] && ko_synced; }
+ko_live() { printf '%s/hashdocsettings' "$KOREADER_DIR"; }
+ko_base() { printf '%s/koreader-base' "$CFG_DIR"; }
+ko_meta() { [[ ${1##*/} == metadata.*.lua ]]; }
+ko_location() { ko_lua get "$KOREADER_DIR/settings.reader.lua" document_metadata_folder 2>/dev/null; }
+md5_of() { md5sum -- "$1" 2>/dev/null | cut -d' ' -f1; }
+
+ko_policy_desc() {
+  case $1 in
+    local) printf "this device's copy wins" ;; remote) printf "the remote copy wins" ;;
+    ask) printf 'ask for each' ;; *) printf 'the newer edit wins' ;;
+  esac
+}
+ko_next_policy() { case $1 in newer) echo local ;; local) echo remote ;; remote) echo ask ;; *) echo newer ;; esac; }
+
+# ko_ready [quiet]: KOReader is synced on this device and everything it needs is in place.
+ko_ready() {
+  local why=
+  ko_on || return 1
+  if ! lua_bin >/dev/null; then why="Lua is not installed (Settings → KOReader installs it)"
+  elif [[ ! -r $KOREADER_DIR/settings.reader.lua ]]; then
+    why="$(tildify "$KOREADER_DIR")/settings.reader.lua can't be read"
+    ((TERMUX)) && why+=" (Android settings → Apps → Termux → Permissions → Files: allow all files)"
+  elif [[ $(ko_location) != hash ]]; then
+    why="KOReader doesn't keep book metadata in its hash-based folder (Settings → KOReader says how to switch)"
+  fi
+  [[ -z $why ]] && return 0
+  [[ ${1:-} == quiet ]] || warn "KOReader is not synced on this device: $why."
+  return 1
+}
+
+# ko_sums DIR: "MD5 TAB path" for every file in DIR's .sdr folders (KOReader's .old backups excluded).
+ko_sums() {
+  [[ -d $1 ]] || return 0
+  (cd -- "$1" && find . -path './*.sdr/*' -type f ! -name '*.old' ! -name '*.tmp' -print0 | xargs -0 -r md5sum --) |
+    sed -n 's|^\([0-9a-f]\{32\}\)  \./|\1\t|p'
+}
+
+ko_state_load() {
+  local p a b m
+  KS_LIVE=() KS_STAGE=() KS_MARK=()
+  [[ -f $KO_STATE ]] || return 0
+  while IFS=$'\t' read -r p a b m; do [[ -n $p ]] && KS_LIVE[$p]=$a KS_STAGE[$p]=$b KS_MARK[$p]=$m; done <"$KO_STATE"
+}
+
+ko_state_save() {
+  local p live; live=$(ko_live)
+  for p in "${!KS_LIVE[@]}"; do
+    # "-" for empty: read would merge two tabs into one and shift the fields.
+    [[ -e $live/$p || -e $LIBRARY_ROOT/$KO_DIR/$p ]] &&
+      printf '%s\t%s\t%s\t%s\n' "$p" "${KS_LIVE[$p]:--}" "${KS_STAGE[$p]:--}" "${KS_MARK[$p]:--}"
+  done | write_atomic "$KO_STATE"
+}
+
+# koreader_import [quiet]: copy what KOReader changed since the last look into the synced folder.
+koreader_import() {
+  local quiet=${1:-} live stage sum rel l s mark held n=0 m=0
+  ko_ready "$quiet" || return 0
+  live=$(ko_live) stage=$LIBRARY_ROOT/$KO_DIR
+  [[ -d $live ]] || return 0
+  ko_state_load
+  while IFS=$'\t' read -r sum rel; do
+    [[ ${KS_LIVE[$rel]-} == "$sum" ]] && continue
+    l=$live/$rel s=$stage/$rel
+    mkdir -p -- "${s%/*}" || return 1
+    if ! ko_meta "$rel"; then
+      { cp -- "$l" "$s.tmp" && mv -f -- "$s.tmp" "$s"; } || continue
+      held=$(md5_of "$s")
+    elif ! mark=$(ko_lua canon "$l" "$s.in.tmp" "-- $KO_DIR/$rel" 2>"$TMP/ko.err"); then
+      [[ -n $quiet ]] || warn "Skipped $(tildify "$l"): $(head -c 300 -- "$TMP/ko.err")"
+      rm -f -- "$s.in.tmp"; continue
+    else
+      held=$(md5_of "$s.in.tmp")
+      if [[ ! -f $s ]] ||
+        { [[ -n ${KS_STAGE[$rel]+x} && ${KS_MARK[$rel]:--} == "$mark" && $(md5_of "$s") == "${KS_STAGE[$rel]}" ]]; }; then
+        mv -f -- "$s.in.tmp" "$s" || continue
+      else
+        # Saved from an older copy: keep what either side has (the "newer" side is KOReader's file).
+        # KOReader's file still holds only its own side, so the next export writes the merge back.
+        if ! ko_lua merge "$s" "-- $KO_DIR/$rel" "$s.in.tmp" "$s" - 1 0 newer 2>"$TMP/ko.err"; then
+          [[ -n $quiet ]] || warn "Skipped $(tildify "$l"): $(head -c 300 -- "$TMP/ko.err")"
+          rm -f -- "$s.in.tmp"; continue
+        fi
+        rm -f -- "$s.in.tmp"; ((++m))
+        log_line "koreader: merged $rel, saved by KOReader from a copy older than the last sync"
+      fi
+    fi
+    touch -r "$l" -- "$s" 2>/dev/null
+    KS_LIVE[$rel]=$sum KS_STAGE[$rel]=$held; ((++n))
+  done < <(ko_sums "$live")
+  ((n)) || return 0
+  ko_state_save
+  [[ -n $quiet ]] && return 0
+  info "KOReader: $n changed file(s) copied into $(tildify "$stage")"
+  ((m)) && info "KOReader: $m of them were saved by a book left open during the last sync - merged, nothing lost."
+  return 0
+}
+
+# koreader_export: after a sync, copy what changed in the synced folder into KOReader's. A file
+# KOReader changed in the meantime is left for the next import to merge; one it deleted stays deleted.
+koreader_export() {
+  local live stage sum rel l s mark n=0
+  ko_ready quiet || return 0
+  live=$(ko_live) stage=$LIBRARY_ROOT/$KO_DIR
+  ko_state_load
+  while IFS=$'\t' read -r sum rel; do
+    [[ ${KS_STAGE[$rel]-} == "$sum" ]] && continue
+    l=$live/$rel s=$stage/$rel
+    if [[ -e $l ]]; then
+      [[ -n ${KS_LIVE[$rel]+x} && $(md5_of "$l") == "${KS_LIVE[$rel]}" ]] || continue
+    else
+      [[ -n ${KS_LIVE[$rel]+x} ]] && continue
+    fi
+    mkdir -p -- "${l%/*}" || continue
+    if ko_meta "$rel"; then
+      mark=$HOST.$(date +%s).$RANDOM
+      if ! ko_lua stamp "$s" "$l" "-- $l" "$mark" 2>"$TMP/ko.err"; then
+        warn "Could not update $(tildify "$l"): $(head -c 300 -- "$TMP/ko.err")"; continue
+      fi
+      KS_MARK[$rel]=$mark
+    else
+      { cp -- "$s" "$l.tmp" && mv -f -- "$l.tmp" "$l"; } || continue
+    fi
+    KS_LIVE[$rel]=$(md5_of "$l") KS_STAGE[$rel]=$sum; ((++n))
+  done < <(ko_sums "$stage")
+  ((n)) || return 0
+  ko_state_save
+  ok "KOReader: updated $n file(s) in $(tildify "$live") - a book open in KOReader shows the changes once reopened."
+  log_line "koreader: updated $n file(s) in KOReader's folder"
+}
+
+# ko_pending OP -> "CHANGED NEW": metadata files that differ from the remote and changed here since
+# the last sync (merged), and, on Pull, those first created here since then (uploaded, not removed).
+ko_pending() {
+  local c p b n=0 k=0
+  if ko_synced; then
+    while IFS=$'\t' read -r c p; do
+      ko_meta "$p" || continue
+      b=$(ko_base)/${p#"$KO_DIR"/}
+      if [[ $c == ladd ]]; then [[ $1 == pull && ! -e $b ]] && ((++k))
+      elif ! { [[ -f $b ]] && cmp -s -- "$LIBRARY_ROOT/$p" "$b"; }; then ((++n)); fi
+    done < <(awk -F'\t' -v OFS='\t' -v d="$KO_DIR/" '
+      index($2, d) == 1 && ($1 == "rnew" || $1 == "lnew" || $1 == "size" || $1 == "ladd") {print $1, $2}' "$TMP/diff")
+  fi
+  echo "$n $k"
+}
+
+# ko_ask CONFLICTS ANSWERS: one question per conflict; L/R/N settle the rest of this sync at once.
+ko_ask() {
+  local id what here remote a i=0 n w
+  n=$(wc -l <"$1"); : >"$2"; term_size
+  w=$((TW > 40 ? TW - 12 : 60))
+  while IFS=$'\t' read -r -u 3 id what here remote; do
+    ((++i)); a=$KO_ALL
+    if [[ -z $a ]]; then
+      printf '\n %sKOReader conflict %d/%d%s  %s\n' "$CY" "$i" "$n" "$C0" "$what"
+      printf '   %shere  %s  %s\n   %sremote%s  %s\n' "$CB" "$C0" "${here:0:w}" "$CB" "$C0" "${remote:0:w}"
+      printf '   %sl%s this device  %sr%s remote  %sn%s newer' "$CB" "$C0" "$CB" "$C0" "$CB" "$C0"
+      [[ $id == a:* ]] && printf '  %sb%s both notes' "$CB" "$C0"
+      printf '  %sL/R/N%s same for all remaining  %sq%s cancel the sync ' "$CB" "$C0" "$CB" "$C0"
+      while :; do
+        read_key
+        case $KEY in
+          l | r) a=$KEY ;; n) a=newer ;; b) [[ $id == a:* ]] && a=b ;;
+          L | R) KO_ALL=${KEY,}; a=$KO_ALL ;; N) KO_ALL=newer; a=newer ;;
+          q | esc) say; return 1 ;;
+        esac
+        [[ -n $a ]] && { say "$a"; break; }
+      done
+    fi
+    printf '%s\t%s\n' "$id" "$a" >>"$2"
+  done 3<"$1"
+}
+
+# ko_merge_file OUT REL LOCAL REMOTE BASE LTIME RTIME: 0 merged, 1 can't merge this file, 2 cancelled.
+ko_merge_file() {
+  local hdr="-- $KO_DIR/$2" rc
+  ko_lua merge "$1" "$hdr" "$3" "$4" "$5" "$6" "$7" "$KO_POLICY" >"$TMP/ko-conflicts" 2>"$TMP/ko.err"
+  rc=$?
+  ((rc == 3)) || return $((rc ? 1 : 0))
+  ko_ask "$TMP/ko-conflicts" "$TMP/ko-answers" || return 2
+  ko_lua merge "$1" "$hdr" "$3" "$4" "$5" "$6" "$7" ask "$TMP/ko-answers" 2>"$TMP/ko.err" || return 1
+}
+
+# After every successful sync the synced KOReader folder equals the remote one: keep it as the merge base.
+save_koreader_base() {
+  local src=$LIBRARY_ROOT/$KO_DIR dst; dst=$(ko_base)
+  ko_synced || return 0
+  rm -rf -- "$dst.tmp" && mkdir -p -- "$dst.tmp" || return 0
+  [[ -d $src ]] && (cd -- "$src" && find . -path './*.sdr/metadata.*.lua' -type f -exec cp --parents -t "$dst.tmp" -- {} +)
+  rm -rf -- "$dst" && mv -- "$dst.tmp" "$dst"
+}
+
+# koreader_merge OP LOCAL_TRASH REMOTE_TRASH
+# Pull/Merge: metadata files that differ from the remote and changed here since the last sync are
+# merged three-way (base: the synced copy after the last sync) and the result is uploaded, so the
+# rclone run that follows finds both sides identical. On Pull, metadata files new here since the
+# last sync are uploaded first rather than removed. On Merge, files unchanged here take the remote
+# copy: Merge otherwise goes by modification time, and where times can't be kept (Android) a copy
+# is dated when it was written, not when KOReader saved it. Returns 1 on failure or when cancelled.
+koreader_merge() {
+  local op=$1 cat p lt rt rel b i rc n=0 up=$TMP/ko-up
+  local -a rels=() lts=() rts=() takes=()
+  ko_synced || return 0
+  : >"$up"
+  while IFS=$'\t' read -r cat p lt rt; do
+    rel=${p#"$KO_DIR"/} b=$(ko_base)/$rel
+    ko_meta "$rel" || continue
+    if [[ $cat == ladd ]]; then
+      [[ $op == pull && ! -e $b ]] && printf '%s\n' "$rel" >>"$up"
+    elif [[ -f $b ]] && cmp -s -- "$LIBRARY_ROOT/$p" "$b"; then
+      [[ $op == merge ]] && takes+=("$rel")  # unchanged here: the remote copy wins (Pull does that anyway)
+    else
+      rels+=("$rel") lts+=("$lt") rts+=("$rt")
+    fi
+  done < <(awk -F'\t' -v OFS='\t' -v d="$KO_DIR/" '
+    index($2, d) == 1 && ($1 == "rnew" || $1 == "lnew" || $1 == "size" || $1 == "ladd") {print $1, $2, $4, $6}' "$TMP/diff")
+  if ((${#rels[@]})) && ! lua_bin >/dev/null; then
+    warn "Lua is not installed, so the newer of each KOReader file replaces the other (Settings → KOReader installs it)."
+    rels=()
+  fi
+  ((${#rels[@]} + ${#takes[@]})) || [[ -s $up ]] || return 0
+  base_flags
+  if ((${#rels[@]} + ${#takes[@]})); then
+    printf '%s\n' "${rels[@]}" "${takes[@]}" | grep . >"$TMP/ko-list"
+    rm -rf -- "$TMP/ko-remote" "$TMP/ko-merged"
+    rclone copy "${BASE[@]}" --files-from "$TMP/ko-list" -- "$(rpath "$KO_DIR")" "$TMP/ko-remote" </dev/null 2>"$TMP/merge.err" ||
+      { err "Could not download KOReader files from the remote:"; rclone_error "$TMP/merge.err"; return 1; }
+  fi
+  if ((${#rels[@]})); then
+    info "Merging KOReader highlights, notes and reading progress from both sides…"
+    # Merge everything first (questions included), so cancelling changes nothing.
+    for i in "${!rels[@]}"; do
+      rel=${rels[i]} b=$(ko_base)/$rel
+      [[ -f $b ]] || b=-
+      mkdir -p -- "$(dirname -- "$TMP/ko-merged/$rel")"
+      ko_merge_file "$TMP/ko-merged/$rel" "$rel" "$LIBRARY_ROOT/$KO_DIR/$rel" "$TMP/ko-remote/$rel" "$b" "${lts[i]}" "${rts[i]}"
+      rc=$?
+      ((rc == 2)) && return 1
+      ((rc)) && warn "Could not merge $KO_DIR/$rel, so the newer copy wins: $(head -c 300 -- "$TMP/ko.err")"
+    done
+  fi
+  for rel in "${takes[@]}"; do
+    [[ -f $TMP/ko-remote/$rel ]] || continue
+    mkdir -p -- "$(dirname -- "$2/$KO_DIR/$rel")" && cp -- "$LIBRARY_ROOT/$KO_DIR/$rel" "$2/$KO_DIR/$rel" &&
+      cp -p -- "$TMP/ko-remote/$rel" "$LIBRARY_ROOT/$KO_DIR/$rel" 2>/dev/null ||
+      cmp -s -- "$TMP/ko-remote/$rel" "$LIBRARY_ROOT/$KO_DIR/$rel" || { err "Could not replace $KO_DIR/$rel."; return 1; }
+  done
+  for rel in "${rels[@]}"; do
+    [[ -f $TMP/ko-merged/$rel ]] || continue
+    # The merged copy is as new as the newer of the two (that is what "newer wins" compares next time).
+    b=$LIBRARY_ROOT/$KO_DIR/$rel
+    [[ $TMP/ko-remote/$rel -nt $b ]] && b=$TMP/ko-remote/$rel
+    touch -r "$b" -- "$TMP/ko-merged/$rel" 2>/dev/null
+    mkdir -p -- "$(dirname -- "$2/$KO_DIR/$rel")" && cp -- "$LIBRARY_ROOT/$KO_DIR/$rel" "$2/$KO_DIR/$rel" &&
+      cp -p -- "$TMP/ko-merged/$rel" "$LIBRARY_ROOT/$KO_DIR/$rel" 2>/dev/null ||
+      cmp -s -- "$TMP/ko-merged/$rel" "$LIBRARY_ROOT/$KO_DIR/$rel" || { err "Could not replace $KO_DIR/$rel."; return 1; }
+    printf '%s\n' "$rel" >>"$up"; ((++n))
+  done
+  if [[ -s $up ]]; then
+    rclone copy "${BASE[@]}" --files-from "$up" --backup-dir "$3/$KO_DIR" -- "$LIBRARY_ROOT/$KO_DIR" "$(rpath "$KO_DIR")" </dev/null 2>"$TMP/merge.err" ||
+      { err "Uploading the KOReader files failed:"; rclone_error "$TMP/merge.err"; return 1; }
+  fi
+  ((n)) && { ok "Merged $n KOReader book(s) (previous copies kept in trash)."; log_line "merged $n KOReader book(s)"; }
+  return 0
+}
+
+koreader_detect() {
+  local d; local -a c=()
+  ((TERMUX)) && [[ -d $HOME/storage/shared ]] && c+=("$(readlink -f -- "$HOME/storage/shared")/koreader")
+  c+=("${XDG_CONFIG_HOME:-$HOME/.config}/koreader" "$HOME/.var/app/rocks.koreader.KOReader/config/koreader")
+  for d in "${c[@]}"; do [[ -f $d/settings.reader.lua ]] && { printf '%s' "$d"; return 0; }; done
+  return 1
+}
+
+install_lua() {
+  case $(pkg_manager) in
+    termux) confirm_run pkg install -y lua54 ;;
+    pacman) confirm_run as_root pacman -S --needed lua ;;
+    apt) confirm_run as_root apt-get install -y lua5.4 ;;
+    dnf) confirm_run as_root dnf install -y lua ;;
+    zypper) confirm_run as_root zypper install -y lua54 ;;
+    *) err "Install Lua (5.1 or newer) with your package manager."; return 1 ;;
+  esac
+}
+
+ko_conflict_hdr() {
+  printf ' %sKOReader conflicts%s  now: %s\n\n' "$CB" "$C0" "$(ko_policy_desc "$KO_CONFLICT")"
+  say " When a highlight was edited on both devices, or the book was read on both, between two syncs:"
+}
+
+koreader_setup() {
+  local d loc
+  cls
+  printf ' %sKOReader%s\n\n' "$CB" "$C0"
+  say " KOReader keeps each book's highlights, notes, bookmarks and reading position in a metadata"
+  say " file. In its hash-based folder these files are named by the book's content, all in one place."
+  say " This tool keeps a copy of them in $(tildify "$LIBRARY_ROOT/$KO_DIR"), syncs it like any folder, merges"
+  say " books annotated on two devices and copies the result back to KOReader. Fonts, margins and zoom"
+  say " stay as each device has them."
+  say
+  d=${KOREADER_DIR:-$(koreader_detect)}
+  ask " KOReader's folder on this device (empty: don't sync KOReader here): " "$d"
+  d=${REPLY/#\~/$HOME}; d=${d%/}
+  if [[ -z $d ]]; then KOREADER_DIR=; save_config; info "KOReader is not synced on this device."; pause; return; fi
+  [[ $d == /* ]] || { err "Please give an absolute path."; pause; return; }
+  if [[ ! -r $d/settings.reader.lua ]]; then
+    warn "$(tildify "$d")/settings.reader.lua can't be read - KOReader creates it the first time it starts."
+    ((TERMUX)) && say "   If KOReader has run, Termux lacks access: Android settings → Apps → Termux → Permissions → Files → allow all."
+    yesno " Use this folder anyway?" n || { pause; return; }
+  fi
+  KOREADER_DIR=$d
+  if ! lua_bin >/dev/null; then
+    yesno " Lua (reads and merges KOReader's files) is not installed. Install it?" y && install_lua
+    lua_bin >/dev/null || warn "Without Lua, KOReader is not synced on this device."
+  fi
+  loc=$(ko_location)
+  if [[ $loc == hash ]]; then
+    ok "KOReader keeps book metadata in its hash-based folder."
+  else
+    warn "KOReader keeps book metadata in the ${loc:-book} folder, so nothing is synced with it yet. In KOReader:"
+    say "   file browser → ⚙ (settings) → Document → Book metadata location → …/koreader/hashdocsettings"
+    say "   then 'Move book metadata' in the same menu moves the existing files there."
+  fi
+  ko_synced || { FOLDERS+=("$KO_DIR"); ok "Added '$KO_DIR' to synced folders."; }
+  mkdir -p -- "$LIBRARY_ROOT/$KO_DIR"
+  save_config; DIFF_READY=0
+  pause
+  run_menu ko_conflict_hdr \
+    "n|Newer wins|the more recent edit; for the reading position, the device that saved last" \
+    "l|This device|keep this device's version" \
+    "r|Remote|keep the version from the remote" \
+    "a|Ask|ask for each conflict (the newer wins when run with -y)"
+  case $MENU_KEY in n) KO_CONFLICT=newer ;; l) KO_CONFLICT=local ;; r) KO_CONFLICT=remote ;; a) KO_CONFLICT=ask ;; esac
+  save_config; cls
+  ok "KOReader conflicts: $(ko_policy_desc "$KO_CONFLICT") (also changeable per sync with c)."
+  koreader_import
+  pause
+}
+
 # ------------------------------------------------------------- settings --
 settings_hdr() {
   printf ' %sSettings%s\n\n' "$CB" "$C0"
@@ -1350,6 +2057,7 @@ settings_menu() {
       "2|Library root|remote folder holding your library ($(rpath))" \
       "3|Local folder|where files live on this device ($(tildify "$LIBRARY_ROOT"))" \
       "4|Sioyek|keep sioyek annotations inside the library" \
+      "k|KOReader|sync KOReader highlights, notes and reading progress" \
       "5|Dependencies|check / install rclone and sioyek" \
       "6|Tuning|parallel transfers, API rate limit, bandwidth" \
       "7|Encrypt config|password-protect rclone.conf (OAuth token)" \
@@ -1363,7 +2071,9 @@ settings_menu() {
          if [[ $f == /* ]]; then LIBRARY_ROOT=${f%/}; mkdir -p -- "$LIBRARY_ROOT/logs"; DIFF_READY=0; save_config
            warn "Existing files were not moved. Move them yourself or pull into the new folder."; pause; fi ;;
       4) sioyek_setup ;;
-      5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"; pause ;;
+      k) koreader_setup ;;
+      5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"
+         lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"; pause ;;
       6) tuning ;;
       7) cls
          f=$(rclone_minor)
@@ -1467,7 +2177,7 @@ uninstall() {
 first_run() {
   local root
   cls
-  printf '\n %slibrary%s - Google Drive sync for books, papers and sioyek annotations\n\n' "$CB" "$C0"
+  printf '\n %slibrary%s - Google Drive sync for books, papers, sioyek and KOReader annotations\n\n' "$CB" "$C0"
   if ((TERMUX)) && [[ ! -d $HOME/storage/shared ]]; then
     say " Reader apps can only open books in shared storage, which Termux needs permission for."
     if yesno " Run termux-setup-storage now (Android will ask for permission)?" y; then
@@ -1497,6 +2207,7 @@ first_run() {
     browse_folders select
   fi
   sioyek_installed && sioyek_setup
+  koreader_detect >/dev/null && yesno " KOReader found on this device. Sync its highlights, notes and reading progress?" y && koreader_setup
   ok "Setup complete. Tip: run Status first, then Pull."
   pause
 }
@@ -1507,6 +2218,7 @@ main_hdr() {
   printf ' %-8s %s\n' Local "$(tildify "$LIBRARY_ROOT")"
   printf ' %-8s %s   %strash → %s:%s%s\n' Remote "$(rpath)" "$CD" "$REMOTE" "$REMOTE_TRASH" "$C0"
   printf ' %-8s %s\n' Folders "$(folders_desc)"
+  ko_on && printf ' %-8s %s\n' KOReader "$(tildify "$KOREADER_DIR")"
   printf ' %-8s %s\n' Filter "$(filter_desc)"
   printf ' %-8s pull %s · push %s\n' Last "$(ago "$LAST_PULL")" "$(ago "$LAST_PUSH")"
 }
@@ -1535,10 +2247,16 @@ Operations
   sioyek's shared.db is merged row by row on Pull and Merge (needs sqlite3):
            highlights/bookmarks added or deleted on either side since the last
            sync are kept or deleted on both. Push uploads this device's copy.
+  KOReader (Settings → KOReader, with its book metadata in the hash-based
+           folder): highlights, notes, bookmarks and reading progress are
+           copied to $KO_DIR/ before each sync and back after it. On Pull and
+           Merge, books changed on both sides are merged highlight by highlight;
+           conflicts follow this device's rule (now: $(ko_policy_desc "$KO_CONFLICT")),
+           which c changes for one sync. Fonts, margins and zoom stay per device.
 
 Only the selected folders are synced; logs/, .trash/ and the scripts stay local.
-The file-type filter is per device (e.g. PDFs only on a tablet); sioyek's
-annotation folder is never filtered. Each sync leaves a marker in
+The file-type filter is per device (e.g. PDFs only on a tablet); the sioyek
+and KOReader annotation folders are never filtered. Each sync leaves a marker in
 $(rpath "$MARKER_DIR")/ so Status shows when other devices last synced.
 
 Command line:  library status | pull | push | merge  [-y] [--force]
@@ -1558,7 +2276,7 @@ main_menu() {
       "x|Filters|file-type filter for this device ($(filter_desc))" \
       "t|Trash|inspect / clean sync backups" \
       "o|Logs|view sync logs" \
-      "c|Settings|Drive connection, sioyek, dependencies, tuning" \
+      "c|Settings|Drive connection, sioyek, KOReader, dependencies, tuning" \
       "?|Help|keys and how syncing works"
     cls
     case $MENU_KEY in
