@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.3.0
+VERSION=1.4.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -580,13 +580,33 @@ pager() {
   done
 }
 
+# termux-open hands a file to other apps through Termux's own content provider
+# (content://com.termux.files/<path>), which refuses to serve anything - the app just shows
+# "Unable to perform request" - unless allow-external-apps is true in termux.properties.
+# Asks once to turn it on (status view only: it draws on the bottom line). -> MSG on refusal.
+termux_share_ok() {
+  local f p=allow-external-apps
+  for f in "$HOME/.termux/termux.properties" "${XDG_CONFIG_HOME:-$HOME/.config}/termux/termux.properties"; do
+    grep -qE "^[[:space:]]*${p}[[:space:]]*[=:]?[[:space:]]*true[[:space:]]*$" "$f" 2>/dev/null && return 0
+  done
+  printf '\e[%d;1H\e[2K %sOther apps can only open Termux files with %s = true in ~/.termux/termux.properties' "$TH" "$CY" "$p"
+  printf ' (it also lets apps you grant Termux'"'"'s RUN_COMMAND permission run commands). Set it?%s %s[y/N]%s ' "$C0" "$CD" "$C0"
+  read_key
+  [[ $KEY == y || $KEY == Y ]] || { MSG="Not opened: Termux keeps files from other apps until $p = true is set."; return 1; }
+  f=$HOME/.termux/termux.properties
+  mkdir -p -- "${f%/*}" && { [[ ! -s $f || $(tail -c1 -- "$f") == '' ]] || echo; echo "$p = true"; } >>"$f" ||
+    { MSG="Could not write $f"; return 1; }
+  have termux-reload-settings && termux-reload-settings >/dev/null 2>&1
+  return 0
+}
+
 # open_path PATH|URL: hand it to the desktop's default handler without blocking the menu.
 open_path() {
   local o
   if ((TERMUX)); then
     if [[ $1 == https://* ]]; then o=termux-open-url
     elif [[ -d $1 ]]; then MSG="Android can't open folders from Termux - it is $1"; return 1
-    else o=termux-open; fi
+    else o=termux-open; termux_share_ok || return 1; fi
     have "$o" || { MSG="$o not found (pkg install termux-tools)."; return 1; }
     "$o" "$1" >/dev/null 2>&1 </dev/null
     return
@@ -632,9 +652,44 @@ drive_id() {
   [[ $id =~ ^[A-Za-z0-9_-]+$ ]] && printf '%s' "$id"
 }
 
+# discard_local CATEGORY PATH -> MSG. Drops this device's unsynced change to PATH: a file only here
+# goes to the local trash; a changed one goes there too and the remote copy replaces it. $TMP/diff
+# and the counts are updated to match, so the status view and a following sync stay right.
+discard_local() {
+  local c=$1 p=$2 f=$LIBRARY_ROOT/$2 t ls rs
+  case $c in
+    ladd | lnew | size) ;;
+    ren) MSG="A rename isn't discarded here - Pull takes the remote name."; return 1 ;;
+    *) MSG="No local change to discard here."; return 1 ;;
+  esac
+  [[ -f $f ]] || { MSG="Not found: $f"; return 1; }
+  [[ $p == "$ANNOT_DIR"/* ]] && sioyek_running && { MSG="Close sioyek first."; return 1; }
+  t=$LIBRARY_ROOT/.trash/$(date +%Y-%m-%d_%H%M%S)/$p
+  { mkdir -p -- "${t%/*}" && mv -- "$f" "$t"; } || { MSG="Could not move $p to the trash."; return 1; }
+  if [[ $c != ladd ]]; then
+    base_flags
+    if ! rclone copyto "${BASE[@]}" -- "$(rpath "$p")" "$f" </dev/null 2>"$TMP/dl.err"; then
+      mv -- "$t" "$f"
+      MSG="Download failed, the local copy stays: $(grep -m1 -E 'ERROR|Failed' "$TMP/dl.err")"; return 1
+    fi
+  fi
+  log_line "discarded local change to $p"
+  read -r ls rs < <(awk -F'\t' -v p="$p" -v c="$c" '$2 == p && $1 == c {print $3, $5; exit}' "$TMP/diff")
+  awk -F'\t' -v OFS='\t' -v p="$p" -v c="$c" '
+    $2 == p && $1 == c { if (c == "ladd") next; $1 = "same"; $3 = $5; $4 = $6 } {print}' "$TMP/diff" >"$TMP/diff.new" &&
+    mv -f -- "$TMP/diff.new" "$TMP/diff"
+  ((CNT[$c]--))
+  if [[ $c == ladd ]]; then ((LOCAL_N--)); LOCAL_B=$((LOCAL_B - ls))
+  else ((CNT[same]++)); LOCAL_B=$((LOCAL_B - ls + rs)); fi
+  # A KOReader file: hand the remote copy to KOReader now (a file only here just stops being synced).
+  [[ $p == "$KO_DIR"/* ]] && koreader_export >/dev/null 2>&1
+  if [[ $c == ladd ]]; then MSG="Moved $p to $(tildify "$LIBRARY_ROOT")/.trash"
+  else MSG="Took the remote copy of $p (the local one is in $(tildify "$LIBRARY_ROOT")/.trash)"; fi
+}
+
 # view_diff [CATEGORY]  -> VIEW_ACTION (p|u|m|r|q)
 view_diff() {
-  local ci=0 sel=0 top=0 q= reload=1 n=0 i j h pw buf line c p ls lt rs rt rp lp a b pad cat tabs MSG=
+  local ci=0 sel=0 top=0 q= reload=1 keep=0 n=0 i j h pw buf line c p ls lt rs rt rp lp a b pad cat tabs MSG=
   local -a ROWS
   for ((j = 0; j < ${#CAT_KEYS[@]}; j++)); do [[ ${CAT_KEYS[j]} == "${1:-changes}" ]] && ci=$j; done
   local hdr; hdr=$(status_header)
@@ -645,7 +700,7 @@ view_diff() {
       mapfile -t ROWS < <(awk -F'\t' -v c="$cat" -v q="${q,,}" '
         (c == "changes" && $1 == "same") || (c != "changes" && $1 != c) { next }
         q != "" && index(tolower($2), q) == 0 { next } { print }' "$TMP/diff")
-      n=${#ROWS[@]} sel=0 top=0 reload=0
+      n=${#ROWS[@]} sel=$keep top=0 reload=0 keep=0
     fi
     term_size
     h=$((TH - $(wc -l <<<"$hdr") - 5)); ((h < 3)) && h=3
@@ -674,7 +729,7 @@ view_diff() {
     done
     ((n)) || buf+="   ${CD}(nothing here)${C0}"$'\n'
     if [[ -n $MSG ]]; then buf+=$'\n'" ${CY}$MSG${C0}"
-    else buf+=$'\n'" ${CD}$((n ? sel + 1 : 0))/$n · j/k move · tab/h/l category · / search · s open · x folder · p pull · u push · m merge · r refresh · q back${C0}"; fi
+    else buf+=$'\n'" ${CD}$((n ? sel + 1 : 0))/$n · j/k move · tab/h/l category · / search · s open · x folder · d discard local · p pull · u push · m merge · r refresh · q back${C0}"; fi
     frame "$buf"
     read_key; MSG=
     case $KEY in
@@ -689,6 +744,25 @@ view_diff() {
           printf '\e[%d;1H\e[2K %s%s…%s' "$TH" "$CD" "$([[ $KEY == x ]] && echo 'Opening folder' || echo Opening)" "$C0"
           IFS=$'\t' read -r c p ls lt rs rt rp lp <<<"${ROWS[sel]}"
           open_row "$([[ $KEY == x ]] && echo 1 || echo 0)" "$rp" "$lp"
+        fi ;;
+      d)
+        if ((n)); then
+          IFS=$'\t' read -r c p ls lt rs rt rp lp <<<"${ROWS[sel]}"
+          case $c in
+            ladd) line="Delete $p? It exists only here (moved to the local trash)" ;;
+            lnew | size) line="Discard the local changes to $p and take the remote copy? (local copy to trash)" ;;
+            *) line= ;;
+          esac
+          if [[ -n $line ]]; then
+            printf '\e[%d;1H\e[2K %s%s%s %s[y/N]%s ' "$TH" "$CY" "${line:0:TW-10}" "$C0" "$CD" "$C0"
+            read_key
+            if [[ $KEY == y || $KEY == Y ]]; then
+              printf '\e[%d;1H\e[2K %s…%s' "$TH" "$CD" "$C0"
+              discard_local "$c" "$p" && { hdr=$(status_header); keep=$sel reload=1; }
+            fi
+          else
+            discard_local "$c" "$p"
+          fi
         fi ;;
       p | u | m | r) VIEW_ACTION=$KEY; return ;;
       q | esc) VIEW_ACTION=q; return ;;
@@ -2230,6 +2304,8 @@ library $VERSION - keyboard
   enter / l       select/open   h / esc  back            q         back / quit
   /               search (status view)                   tab       next category
   s / x           open file / its folder (status view; Drive files open in the browser)
+  d               discard the selected local change (status view): delete a file that only
+                  exists here, or replace a changed one with the remote copy (old copy to trash)
 
 Operations
   Status   lists both sides (in parallel) and classifies every file:
