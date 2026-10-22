@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.3.0'
+$Version = '1.4.1'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'
@@ -694,9 +694,44 @@ function Get-DriveId([string]$path, [bool]$isDir) {
   return ''
 }
 
+# Drops this device's unsynced change to the row's file: a file only here goes to the local trash; a
+# changed one goes there too and the remote copy replaces it. Rows and counts are updated to match,
+# so the status view and a following sync stay right. Returns the message to show.
+function Remove-LocalChange($r) {
+  if ($r.C -eq 'ren') { return "A rename isn't discarded here - Pull takes the remote name." }
+  if (@('ladd', 'lnew', 'size') -notcontains $r.C) { return 'No local change to discard here.' }
+  $sep = [IO.Path]::DirectorySeparatorChar
+  $f = Join-Path $Cfg.LIBRARY_ROOT ($r.P.Replace('/', $sep))
+  if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { return "Not found: $f" }
+  if ($r.P.StartsWith("$AnnotDir/", [StringComparison]::Ordinal) -and (Test-SioyekRunning)) { return 'Close sioyek first.' }
+  $trash = Join-Path $Cfg.LIBRARY_ROOT '.trash'
+  $t = Join-Path (Join-Path $trash (Get-Date).ToString('yyyy-MM-dd_HHmmss')) ($r.P.Replace('/', $sep))
+  try {
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t)
+    Move-Item -LiteralPath $f -Destination $t
+  } catch { return "Could not move $($r.P) to the trash." }
+  if ($r.C -ne 'ladd') {
+    $x = Invoke-Rc (@('copyto') + (Get-BaseFlags) + @('--', (Get-RPath $r.P), $f))
+    if ($x.Code -ne 0) {
+      Move-Item -LiteralPath $t -Destination $f
+      return "Download failed, the local copy stays: $(@($x.Err -split "`n" | Where-Object { $_ -match 'ERROR|Failed' })[0])"
+    }
+  }
+  Add-LogLine "discarded local change to $($r.P)"
+  $Run.Cnt[$r.C]--
+  if ($r.C -eq 'ladd') {
+    $Run.LocalN--; $Run.LocalB -= [long]$r.LS
+    $Run.Rows = [Array]@($Run.Rows | Where-Object { -not [object]::ReferenceEquals($_, $r) })
+    return "Moved $($r.P) to $(Get-Tilde $trash)"
+  }
+  $Run.LocalB += [long]$r.RS - [long]$r.LS
+  $r.C = 'same'; $r.LS = $r.RS; $r.LT = $r.RT; $Run.Cnt['same']++
+  return "Took the remote copy of $($r.P) (the local one is in $(Get-Tilde $trash))"
+}
+
 function Show-Diff([string]$start = 'changes') {
   $ci = [Math]::Max(0, [array]::IndexOf($CatKeys, $start))
-  $sel = 0; $top = 0; $q = ''; $reload = $true; $msg = ''
+  $sel = 0; $top = 0; $q = ''; $reload = $true; $keep = 0; $msg = ''
   $rows = New-Object Collections.Generic.List[object]
   $hdr = @(Get-StatusHeader)
   Set-Cursor $false
@@ -709,7 +744,7 @@ function Show-Diff([string]$start = 'changes') {
         if ($q -and (Get-RowPath $r).IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $rows.Add($r)
       }
-      $sel = 0; $top = 0; $reload = $false
+      $sel = $keep; $top = 0; $reload = $false; $keep = 0
     }
     $n = $rows.Count; $sz = Get-TermSize
     $h = [Math]::Max(3, $sz[0] - $hdr.Count - 5)
@@ -736,7 +771,7 @@ function Show-Diff([string]$start = 'changes') {
     if ($n -eq 0) { [void]$sb.Append("   $CD(nothing here)$C0`n") }
     $pos = if ($n) { $sel + 1 } else { 0 }
     if ($msg) { [void]$sb.Append("`n $CY$msg$C0") }
-    else { [void]$sb.Append("`n $CD$pos/$n $([char]0xB7) j/k move $([char]0xB7) tab/h/l category $([char]0xB7) / search $([char]0xB7) s open $([char]0xB7) x folder $([char]0xB7) p pull $([char]0xB7) u push $([char]0xB7) m merge $([char]0xB7) r refresh $([char]0xB7) q back$C0") }
+    else { [void]$sb.Append("`n $CD$pos/$n $([char]0xB7) j/k move $([char]0xB7) tab/h/l category $([char]0xB7) / search $([char]0xB7) s open $([char]0xB7) x folder $([char]0xB7) d discard local $([char]0xB7) p pull $([char]0xB7) u push $([char]0xB7) m merge $([char]0xB7) r refresh $([char]0xB7) q back$C0") }
     Write-Frame $sb.ToString()
     $k = Read-Key; $msg = ''
     if ($k -ceq 'j') { $sel++ } elseif ($k -ceq 'k') { $sel-- }
@@ -748,6 +783,24 @@ function Show-Diff([string]$start = 'changes') {
     elseif (($k -ceq 's' -or $k -ceq 'x') -and $n) {
       [Console]::Write("$Ansi[$($sz[0]);1H$Ansi[2K $CD$(if ($k -ceq 'x') { 'Opening folder' } else { 'Opening' })$Ell$C0")
       $msg = Open-Row $rows[$sel] ($k -ceq 'x')
+    }
+    elseif ($k -ceq 'd' -and $n) {
+      $r = $rows[$sel]
+      $ask = switch ($r.C) {
+        'ladd' { "Delete $($r.P)? It exists only here (moved to the local trash)" }
+        { $_ -eq 'lnew' -or $_ -eq 'size' } { "Discard the local changes to $($r.P) and take the remote copy? (local copy to trash)" }
+        default { '' }
+      }
+      if (-not $ask) { $msg = Remove-LocalChange $r }
+      else {
+        if ($ask.Length -gt $sz[1] - 10) { $ask = $ask.Substring(0, [Math]::Max(10, $sz[1] - 10)) }
+        [Console]::Write("$Ansi[$($sz[0]);1H$Ansi[2K $CY$ask$C0 $CD[y/N]$C0 ")
+        if ((Read-Key) -ceq 'y') {
+          [Console]::Write("$Ansi[$($sz[0]);1H$Ansi[2K $CD$Ell$C0")
+          $msg = Remove-LocalChange $r
+          $hdr = @(Get-StatusHeader); $keep = $sel; $reload = $true
+        }
+      }
     }
     elseif ($k -ceq 'p' -or $k -ceq 'u' -or $k -ceq 'm' -or $k -ceq 'r') { $Run.ViewAction = $k; return }
     elseif ($k -ceq 'q' -or $k -eq 'esc') { $Run.ViewAction = 'q'; return }
@@ -1664,6 +1717,8 @@ library $Version - keyboard
   enter / l       select/open   h / esc  back            q         back / quit
   /               search (status view)                   tab       next category
   s / x           open file / its folder (status view; Drive files open in the browser)
+  d               discard the selected local change (status view): delete a file that only
+                  exists here, or replace a changed one with the remote copy (old copy to trash)
 
 Operations
   Status   lists both sides (in parallel) and classifies every file:

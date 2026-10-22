@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.3.0
+VERSION=1.4.1
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -398,7 +398,7 @@ compute_diff() {
     printf '%sListing %s and %s …%s\n' "$CD" "$(tildify "$LIBRARY_ROOT")" "$(rpath)" "$C0"
     start_listings "$TMP/ls.$RANDOM$RANDOM"
   else
-    ko_ready >/dev/null  # the prefetch imported quietly: still say why KOReader isn't synced, if it isn't
+    ko_ready >/dev/null && ko_archive_check  # the prefetch imported quietly: still warn here
   fi
   wait "${LIST_PIDS[@]}" 2>/dev/null
   d=$LIST_DIR LIST_DIR=
@@ -580,13 +580,52 @@ pager() {
   done
 }
 
+# termux-open hands a file to other apps through Termux's own content provider
+# (content://com.termux.files/<path>), which refuses to serve anything - the app just shows
+# "Unable to perform request" - unless allow-external-apps is true in termux.properties.
+TERMUX_SHARE_NOTE="It also lets apps you grant Termux's RUN_COMMAND permission run commands."
+termux_share_on() {
+  local f
+  for f in "$HOME/.termux/termux.properties" "${XDG_CONFIG_HOME:-$HOME/.config}/termux/termux.properties"; do
+    grep -qE "^[[:space:]]*allow-external-apps[[:space:]]*[=:]?[[:space:]]*true[[:space:]]*$" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+termux_share_enable() {
+  local f=$HOME/.termux/termux.properties
+  mkdir -p -- "${f%/*}" && { [[ ! -s $f || $(tail -c1 -- "$f") == '' ]] || echo; echo "allow-external-apps = true"; } >>"$f" ||
+    { MSG="Could not write $f"; return 1; }
+  have termux-reload-settings && termux-reload-settings >/dev/null 2>&1
+  return 0
+}
+
+# Status view only (asks on the bottom line) -> MSG on refusal.
+termux_share_ok() {
+  termux_share_on && return 0
+  printf '\e[%d;1H\e[2K %sOther apps can only open Termux files with allow-external-apps = true in ~/.termux/termux.properties.' "$TH" "$CY"
+  printf ' %s Set it?%s %s[y/N]%s ' "$TERMUX_SHARE_NOTE" "$C0" "$CD" "$C0"
+  read_key
+  [[ $KEY == y || $KEY == Y ]] || { MSG="Not opened: Termux keeps files from other apps until allow-external-apps = true is set."; return 1; }
+  termux_share_enable
+}
+
+# Setup screens: explain and offer it.
+termux_share_setup() {
+  termux_share_on && return 0
+  say " Reader apps can only open files from Termux (Status → s) once allow-external-apps = true is"
+  say " in ~/.termux/termux.properties. $TERMUX_SHARE_NOTE"
+  if yesno " Set it now?" y; then termux_share_enable && ok "Other apps can now open the files this tool hands them." || err "$MSG"
+  fi
+}
+
 # open_path PATH|URL: hand it to the desktop's default handler without blocking the menu.
 open_path() {
   local o
   if ((TERMUX)); then
     if [[ $1 == https://* ]]; then o=termux-open-url
     elif [[ -d $1 ]]; then MSG="Android can't open folders from Termux - it is $1"; return 1
-    else o=termux-open; fi
+    else o=termux-open; termux_share_ok || return 1; fi
     have "$o" || { MSG="$o not found (pkg install termux-tools)."; return 1; }
     "$o" "$1" >/dev/null 2>&1 </dev/null
     return
@@ -632,9 +671,44 @@ drive_id() {
   [[ $id =~ ^[A-Za-z0-9_-]+$ ]] && printf '%s' "$id"
 }
 
+# discard_local CATEGORY PATH -> MSG. Drops this device's unsynced change to PATH: a file only here
+# goes to the local trash; a changed one goes there too and the remote copy replaces it. $TMP/diff
+# and the counts are updated to match, so the status view and a following sync stay right.
+discard_local() {
+  local c=$1 p=$2 f=$LIBRARY_ROOT/$2 t ls rs
+  case $c in
+    ladd | lnew | size) ;;
+    ren) MSG="A rename isn't discarded here - Pull takes the remote name."; return 1 ;;
+    *) MSG="No local change to discard here."; return 1 ;;
+  esac
+  [[ -f $f ]] || { MSG="Not found: $f"; return 1; }
+  [[ $p == "$ANNOT_DIR"/* ]] && sioyek_running && { MSG="Close sioyek first."; return 1; }
+  t=$LIBRARY_ROOT/.trash/$(date +%Y-%m-%d_%H%M%S)/$p
+  { mkdir -p -- "${t%/*}" && mv -- "$f" "$t"; } || { MSG="Could not move $p to the trash."; return 1; }
+  if [[ $c != ladd ]]; then
+    base_flags
+    if ! rclone copyto "${BASE[@]}" -- "$(rpath "$p")" "$f" </dev/null 2>"$TMP/dl.err"; then
+      mv -- "$t" "$f"
+      MSG="Download failed, the local copy stays: $(grep -m1 -E 'ERROR|Failed' "$TMP/dl.err")"; return 1
+    fi
+  fi
+  log_line "discarded local change to $p"
+  read -r ls rs < <(awk -F'\t' -v p="$p" -v c="$c" '$2 == p && $1 == c {print $3, $5; exit}' "$TMP/diff")
+  awk -F'\t' -v OFS='\t' -v p="$p" -v c="$c" '
+    $2 == p && $1 == c { if (c == "ladd") next; $1 = "same"; $3 = $5; $4 = $6 } {print}' "$TMP/diff" >"$TMP/diff.new" &&
+    mv -f -- "$TMP/diff.new" "$TMP/diff"
+  ((CNT[$c]--))
+  if [[ $c == ladd ]]; then ((LOCAL_N--)); LOCAL_B=$((LOCAL_B - ls))
+  else ((CNT[same]++)); LOCAL_B=$((LOCAL_B - ls + rs)); fi
+  # A KOReader file: hand the remote copy to KOReader now (a file only here just stops being synced).
+  [[ $p == "$KO_DIR"/* ]] && koreader_export >/dev/null 2>&1
+  if [[ $c == ladd ]]; then MSG="Moved $p to $(tildify "$LIBRARY_ROOT")/.trash"
+  else MSG="Took the remote copy of $p (the local one is in $(tildify "$LIBRARY_ROOT")/.trash)"; fi
+}
+
 # view_diff [CATEGORY]  -> VIEW_ACTION (p|u|m|r|q)
 view_diff() {
-  local ci=0 sel=0 top=0 q= reload=1 n=0 i j h pw buf line c p ls lt rs rt rp lp a b pad cat tabs MSG=
+  local ci=0 sel=0 top=0 q= reload=1 keep=0 n=0 i j h pw buf line c p ls lt rs rt rp lp a b pad cat tabs MSG=
   local -a ROWS
   for ((j = 0; j < ${#CAT_KEYS[@]}; j++)); do [[ ${CAT_KEYS[j]} == "${1:-changes}" ]] && ci=$j; done
   local hdr; hdr=$(status_header)
@@ -645,7 +719,7 @@ view_diff() {
       mapfile -t ROWS < <(awk -F'\t' -v c="$cat" -v q="${q,,}" '
         (c == "changes" && $1 == "same") || (c != "changes" && $1 != c) { next }
         q != "" && index(tolower($2), q) == 0 { next } { print }' "$TMP/diff")
-      n=${#ROWS[@]} sel=0 top=0 reload=0
+      n=${#ROWS[@]} sel=$keep top=0 reload=0 keep=0
     fi
     term_size
     h=$((TH - $(wc -l <<<"$hdr") - 5)); ((h < 3)) && h=3
@@ -674,7 +748,7 @@ view_diff() {
     done
     ((n)) || buf+="   ${CD}(nothing here)${C0}"$'\n'
     if [[ -n $MSG ]]; then buf+=$'\n'" ${CY}$MSG${C0}"
-    else buf+=$'\n'" ${CD}$((n ? sel + 1 : 0))/$n · j/k move · tab/h/l category · / search · s open · x folder · p pull · u push · m merge · r refresh · q back${C0}"; fi
+    else buf+=$'\n'" ${CD}$((n ? sel + 1 : 0))/$n · j/k move · tab/h/l category · / search · s open · x folder · d discard local · p pull · u push · m merge · r refresh · q back${C0}"; fi
     frame "$buf"
     read_key; MSG=
     case $KEY in
@@ -689,6 +763,25 @@ view_diff() {
           printf '\e[%d;1H\e[2K %s%s…%s' "$TH" "$CD" "$([[ $KEY == x ]] && echo 'Opening folder' || echo Opening)" "$C0"
           IFS=$'\t' read -r c p ls lt rs rt rp lp <<<"${ROWS[sel]}"
           open_row "$([[ $KEY == x ]] && echo 1 || echo 0)" "$rp" "$lp"
+        fi ;;
+      d)
+        if ((n)); then
+          IFS=$'\t' read -r c p ls lt rs rt rp lp <<<"${ROWS[sel]}"
+          case $c in
+            ladd) line="Delete $p? It exists only here (moved to the local trash)" ;;
+            lnew | size) line="Discard the local changes to $p and take the remote copy? (local copy to trash)" ;;
+            *) line= ;;
+          esac
+          if [[ -n $line ]]; then
+            printf '\e[%d;1H\e[2K %s%s%s %s[y/N]%s ' "$TH" "$CY" "${line:0:TW-10}" "$C0" "$CD" "$C0"
+            read_key
+            if [[ $KEY == y || $KEY == Y ]]; then
+              printf '\e[%d;1H\e[2K %s…%s' "$TH" "$CD" "$C0"
+              discard_local "$c" "$p" && { hdr=$(status_header); keep=$sel reload=1; }
+            fi
+          else
+            discard_local "$c" "$p"
+          fi
         fi ;;
       p | u | m | r) VIEW_ACTION=$KEY; return ;;
       q | esc) VIEW_ACTION=q; return ;;
@@ -1756,10 +1849,24 @@ ko_state_save() {
   done | write_atomic "$KO_STATE"
 }
 
+# KOReader's "Book metadata archive" can save a copy of every book's metadata as <partial md5>.lua
+# when it is closed. Pointed into the library, those copies get synced as extra files.
+ko_archive_check() {
+  local a; a=$(ko_lua get "$KOREADER_DIR/settings.reader.lua" document_metadata_arc_folder 2>/dev/null)
+  [[ -n $a ]] || return 0
+  a=$(readlink -f -- "$a" 2>/dev/null || printf '%s' "${a%/}")
+  [[ -n $a && ($a == "$LIBRARY_ROOT" || $a == "$LIBRARY_ROOT"/*) ]] || return 0
+  warn "KOReader's book metadata archive is $(tildify "$a"), so it saves a copy of every book you close there as"
+  say "  <hash>.lua and those get synced too (the sync already covers the metadata). In KOReader: ⚙ → Document →"
+  say "  Book metadata archive → Archive location: pick a folder outside the library (KOReader moves the copies"
+  say "  there), or turn off 'Save metadata to archive on book closing'."
+}
+
 # koreader_import [quiet]: copy what KOReader changed since the last look into the synced folder.
 koreader_import() {
   local quiet=${1:-} live stage sum rel l s mark held n=0 m=0
   ko_ready "$quiet" || return 0
+  [[ -n $quiet ]] || ko_archive_check
   live=$(ko_live) stage=$LIBRARY_ROOT/$KO_DIR
   [[ -d $live ]] || return 0
   ko_state_load
@@ -2026,6 +2133,7 @@ koreader_setup() {
     say "   file browser → ⚙ (settings) → Document → Book metadata location → …/koreader/hashdocsettings"
     say "   then 'Move book metadata' in the same menu moves the existing files there."
   fi
+  ko_archive_check
   ko_synced || { FOLDERS+=("$KO_DIR"); ok "Added '$KO_DIR' to synced folders."; }
   mkdir -p -- "$LIBRARY_ROOT/$KO_DIR"
   save_config; DIFF_READY=0
@@ -2073,7 +2181,9 @@ settings_menu() {
       4) sioyek_setup ;;
       k) koreader_setup ;;
       5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"
-         lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"; pause ;;
+         lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"
+         ((TERMUX)) && { termux_share_on && ok "Termux lets other apps open files (allow-external-apps)" || termux_share_setup; }
+         pause ;;
       6) tuning ;;
       7) cls
          f=$(rclone_minor)
@@ -2185,6 +2295,7 @@ first_run() {
       [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(termux_root)
     fi
   fi
+  ((TERMUX)) && { termux_share_setup; say; }
   say " Where should the library live on this device?"
   say " ${CD}(files, logs and this script are kept here; settings go to $(tildify "$CFG_DIR"))${C0}"
   ask " Library folder: " "$LIBRARY_ROOT"
@@ -2230,6 +2341,8 @@ library $VERSION - keyboard
   enter / l       select/open   h / esc  back            q         back / quit
   /               search (status view)                   tab       next category
   s / x           open file / its folder (status view; Drive files open in the browser)
+  d               discard the selected local change (status view): delete a file that only
+                  exists here, or replace a changed one with the remote copy (old copy to trash)
 
 Operations
   Status   lists both sides (in parallel) and classifies every file:
