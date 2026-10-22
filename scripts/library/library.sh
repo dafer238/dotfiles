@@ -5,6 +5,7 @@
 #   library status        print sync status and exit
 #   library pull|push|merge [-y] [--force]
 #   library setup         re-run first-time setup
+#   library uninstall     remove the tool from this device (asks before touching your files)
 #
 # Everything is driven by rclone. Per-device settings live in
 # ${XDG_CONFIG_HOME:-~/.config}/library-sync/ (never synced).
@@ -35,8 +36,10 @@ umask 077
 
 # ---------------------------------------------------------------- defaults --
 LIBRARY_ROOT=$HOME/library
-# On Android the library must be in shared storage so reader apps can open the books.
-((TERMUX)) && [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(readlink -f -- "$HOME/storage/shared")/library
+# On Android the library must be in shared storage so reader apps can open the books:
+# Documents/library in internal storage (/storage/emulated/0/Documents/library).
+termux_root() { printf '%s/Documents/library' "$(readlink -f -- "$HOME/storage/shared")"; }
+((TERMUX)) && [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(termux_root)
 CHECKSUM=  # 1 = this filesystem can't keep modification times: compare by MD5 (see checksum_mode)
 REMOTE=gdrive
 REMOTE_PATH=library
@@ -1229,7 +1232,8 @@ settings_menu() {
       "6|Tuning|parallel transfers, API rate limit, bandwidth" \
       "7|Encrypt config|password-protect rclone.conf (OAuth token)" \
       "8|Launcher|install a 'library' command in $(tildify "$(launcher_dir)")" \
-      "9|Filter rules|show the generated rclone filter file"
+      "9|Filter rules|show the generated rclone filter file" \
+      "u|Uninstall|remove library from this device (keeps your books unless you ask)"
     case $MENU_KEY in
       1) setup_remote ;;
       2) DIRCACHE=(); browse_folders root ;;
@@ -1245,6 +1249,7 @@ settings_menu() {
          else info "Run 'rclone config' and choose 's) Set configuration password'."; pause; fi ;;
       8) install_launcher; pause ;;
       9) build_filters && pager "rclone filter rules" "$FILTER_FILE" ;;
+      u) uninstall && exit 0 ;;
       q) return ;;
     esac
   done
@@ -1275,6 +1280,67 @@ install_launcher() {
   [[ :$PATH: == *":$bin:"* ]] || warn "$bin is not in your PATH - add it to your shell profile."
 }
 
+# ------------------------------------------------------------ uninstall --
+# Removes the tool from this device: scripts, logs, settings, the launcher and this device's
+# record on the remote. Books and annotations stay unless the user explicitly asks (default no).
+uninstall() {
+  local root=$LIBRARY_ROOT f bin target del_content=0 del_login=0 has_remote=0 launcher=0
+  local -a scripts=()
+  for f in library.sh library.ps1 library.cmd; do [[ -e $root/$f ]] && scripts+=("$root/$f"); done
+  bin=$(launcher_dir)/library
+  # Only remove a launcher that points at this library (symlink or Termux wrapper).
+  if [[ -L $bin && $(readlink -f -- "$bin") == "$root/library.sh" ]] ||
+    { [[ -f $bin && ! -L $bin ]] && grep -qF -- "$root/library.sh" "$bin" 2>/dev/null; }; then launcher=1; fi
+  have rclone && [[ -n $(remote_type) ]] && has_remote=1
+  cls
+  say " ${CB}Uninstall library from this device${C0}"; say
+  say " Will remove:"
+  for f in "${scripts[@]}"; do say "   $(tildify "$f")"; done
+  [[ -d $root/logs ]] && say "   $(tildify "$root/logs")/  ${CD}(sync logs)${C0}"
+  [[ -d $CFG_DIR ]] && say "   $(tildify "$CFG_DIR")/  ${CD}(this device's settings)${C0}"
+  ((launcher)) && say "   $(tildify "$bin")  ${CD}(the 'library' command)${C0}"
+  ((has_remote)) && say "   $(rpath "$MARKER_DIR/$HOST.txt")  ${CD}(this device's sync record)${C0}"
+  say; say " Will keep:"
+  say "   $(tildify "$root")/ with your books, annotations and .trash, the copy on Google Drive,"
+  say "   rclone and sioyek"
+  say
+  if [[ -d $root ]] && yesno " Also delete $(tildify "$root") and every file in it from this device?" n; then
+    warn "Deleted files do not go to trash. The copy on Google Drive is not touched."
+    ask " Type 'delete' to confirm: "
+    if [[ $REPLY == delete ]]; then del_content=1; else info "Keeping your files."; fi
+  fi
+  ((has_remote)) && yesno " Also remove the Google Drive login '$REMOTE' from rclone?" n && del_login=1
+  yesno " Uninstall now?" n || { info "Cancelled."; pause; return 1; }
+  say
+  base_flags
+  if ((has_remote)) && rclone deletefile "${BASE[@]}" -- "$(rpath "$MARKER_DIR/$HOST.txt")" </dev/null 2>/dev/null; then
+    ok "Removed this device from the remote sync records."
+  fi
+  if ((del_login)); then
+    if rclone config delete "$REMOTE" </dev/null 2>/dev/null; then ok "Removed rclone remote '$REMOTE'."
+    else warn "Could not remove rclone remote '$REMOTE'."; fi
+  fi
+  if ((del_content)); then
+    # sioyek would otherwise keep pointing at a database that no longer exists.
+    sioyek_paths
+    target=$root/$ANNOT_DIR/shared.db
+    if [[ -f $SY_PREFS ]] && grep -qF -- "shared_database_path $target" "$SY_PREFS" 2>/dev/null; then
+      grep -vF -- "shared_database_path $target" "$SY_PREFS" | write_atomic "$SY_PREFS" && ok "sioyek uses its own annotation database again."
+    fi
+  fi
+  ((launcher)) && rm -f -- "$bin" && ok "Removed $(tildify "$bin")"
+  [[ -n $CFG_DIR && -d $CFG_DIR ]] && rm -rf -- "$CFG_DIR" && ok "Removed $(tildify "$CFG_DIR")"
+  cd -- "$HOME" || cd /
+  if ((del_content)) && [[ $root == /?* && $root != "$HOME" && $root != "${HOME%/}/" ]]; then
+    rm -rf -- "$root" && ok "Deleted $(tildify "$root")"
+  else
+    [[ -d $root/logs ]] && rm -rf -- "$root/logs"
+    ((${#scripts[@]})) && rm -f -- "${scripts[@]}"
+    ok "Removed the scripts and logs; your files are still in $(tildify "$root")"
+  fi
+  say; ok "library is uninstalled from this device."
+}
+
 # ------------------------------------------------------------ first run --
 first_run() {
   local root
@@ -1284,7 +1350,7 @@ first_run() {
     say " Reader apps can only open books in shared storage, which Termux needs permission for."
     if yesno " Run termux-setup-storage now (Android will ask for permission)?" y; then
       termux-setup-storage; sleep 2
-      [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(readlink -f -- "$HOME/storage/shared")/library
+      [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(termux_root)
     fi
   fi
   say " Where should the library live on this device?"
@@ -1397,7 +1463,7 @@ main_menu() {
   done
 }
 
-usage() { sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd=${1:-menu} yes=0 force=0 a
@@ -1408,6 +1474,12 @@ main() {
     -h | --help | help) usage; return 0 ;;
     -V | --version | version) say "$VERSION"; return 0 ;;
     menu | status | pull | push | merge | setup) ;;
+    uninstall)
+      [[ -t 0 && $TTY == 1 ]] || { err "Uninstall asks questions - run it in a terminal."; return 1; }
+      load_kv "$CFG_FILE"
+      have rclone && unlock_rclone
+      uninstall && exit 0
+      return 1 ;;
     *) usage; return 1 ;;
   esac
   if [[ $cmd == setup ]] || ! load_kv "$CFG_FILE"; then

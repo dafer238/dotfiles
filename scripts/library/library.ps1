@@ -6,6 +6,7 @@
   library status           print sync status and exit
   library pull|push|merge [-Yes] [-Force]
   library setup            re-run first-time setup
+  library uninstall        remove the tool from this device (asks before touching your files)
 
   Everything is driven by rclone. Per-device settings live in %APPDATA%\library-sync (never synced).
   Works on Windows PowerShell 5.1 and PowerShell 7+.
@@ -13,7 +14,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('menu', 'status', 'pull', 'push', 'merge', 'setup', 'help', 'version')]
+  [ValidateSet('menu', 'status', 'pull', 'push', 'merge', 'setup', 'uninstall', 'help', 'version')]
   [string]$Command = 'menu',
   [Alias('y')][switch]$Yes,
   [switch]$Force
@@ -58,7 +59,7 @@ $State = @{ LAST_PULL = ''; LAST_PUSH = ''; LAST_MERGE = '' }
 $Run = @{
   DiffReady = $false; RemoteMissing = $false; Rows = $null; Cnt = @{}; LocalN = 0; LocalB = 0; RemoteN = 0; RemoteB = 0
   Markers = ''; About = ''; DiffTime = ''; MenuPos = @{}; DirCache = (New-Object Collections.Hashtable ([StringComparer]::Ordinal))
-  Rclone = $null; Tmp = $null; KeyQueue = $null; Interactive = $false; LastRc = 0; MenuKey = ''; ViewAction = ''; RemoteOk = $false; ConfFile = ''; Prefetch = $null
+  Rclone = $null; Tmp = $null; KeyQueue = $null; Interactive = $false; LastRc = 0; MenuKey = ''; ViewAction = ''; RemoteOk = $false; ConfFile = ''; Prefetch = $null; Quit = $false
 }
 
 # ------------------------------------------------------------------ colours --
@@ -1353,7 +1354,8 @@ function Show-Settings {
       '6|Tuning|parallel transfers, API rate limit, bandwidth',
       '7|Encrypt config|password-protect rclone.conf (OAuth token)',
       "8|Launcher|add $(Get-Tilde $Cfg.LIBRARY_ROOT) to PATH so 'library' works anywhere",
-      '9|Filter rules|show the generated rclone filter file')
+      '9|Filter rules|show the generated rclone filter file',
+      'u|Uninstall|remove library from this device (keeps your books unless you ask)')
     switch ($Run.MenuKey) {
       '1' { Set-Remote }
       '2' { $Run.DirCache.Clear(); Select-Folders 'root' }
@@ -1376,9 +1378,78 @@ function Show-Settings {
       }
       '8' { Clear-Screen; Install-Launcher; Wait-AnyKey }
       '9' { if (Build-Filters) { Show-Pager 'rclone filter rules' @([IO.File]::ReadAllLines($FilterFile)) } }
+      'u' { if (Uninstall-Library) { $Run.Quit = $true; return } }
       'q' { return }
     }
   }
+}
+
+# ---------------------------------------------------------------- uninstall --
+# Removes the tool from this device: scripts, logs, settings, the PATH entry and this device's
+# record on the remote. Books and annotations stay unless the user explicitly asks (default no).
+# Returns $true when uninstalled.
+function Uninstall-Library {
+  $root = $Cfg.LIBRARY_ROOT
+  Clear-Screen
+  $scripts = @('library.ps1', 'library.cmd', 'library.sh' | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path -LiteralPath $_ })
+  $logs = Join-Path $root 'logs'
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); if (-not $userPath) { $userPath = '' }
+  $onPath = ($userPath -split ';') -contains $root
+  $hasRemote = $Run.Rclone -and (Get-RemoteType)
+  Say " ${CB}Uninstall library from this device$C0"; Say
+  Say ' Will remove:'
+  foreach ($s in $scripts) { Say "   $(Get-Tilde $s)" }
+  if (Test-Path -LiteralPath $logs) { Say "   $(Get-Tilde $logs)\  ${CD}(sync logs)$C0" }
+  if (Test-Path -LiteralPath $CfgDir) { Say "   $(Get-Tilde $CfgDir)\  ${CD}(this device's settings)$C0" }
+  if ($onPath) { Say "   $root from your user PATH" }
+  if ($hasRemote) { Say "   $(Get-RPath "$MarkerDir/$HostId.txt")  ${CD}(this device's sync record)$C0" }
+  Say; Say ' Will keep:'
+  Say "   $(Get-Tilde $root)\ with your books, annotations and .trash, the copy on Google Drive,"
+  Say '   rclone, scoop and sioyek'
+  Say
+  $delContent = $false
+  if ((Test-Path -LiteralPath $root) -and (Read-YesNo " Also delete $(Get-Tilde $root) and every file in it from this device?" 'n')) {
+    Write-Warn 'Deleted files do not go to trash. The copy on Google Drive is not touched.'
+    if ((Read-Line " Type 'delete' to confirm") -ceq 'delete') { $delContent = $true } else { Write-Info 'Keeping your files.' }
+  }
+  $delLogin = $false
+  if ($hasRemote) { $delLogin = Read-YesNo " Also remove the Google Drive login '$($Cfg.REMOTE)' from rclone?" 'n' }
+  if (-not (Read-YesNo ' Uninstall now?' 'n')) { Write-Info 'Cancelled.'; Wait-AnyKey; return $false }
+  Say
+  if ($hasRemote) {
+    $r = Invoke-Rc (@('deletefile') + (Get-BaseFlags) + @('--', (Get-RPath "$MarkerDir/$HostId.txt")))
+    if ($r.Code -eq 0) { Write-Ok 'Removed this device from the remote sync records.' }
+  }
+  if ($delLogin) {
+    $r = Invoke-Rc @('config', 'delete', $Cfg.REMOTE)
+    if ($r.Code -eq 0) { Write-Ok "Removed rclone remote '$($Cfg.REMOTE)'." } else { Write-Warn "Could not remove rclone remote '$($Cfg.REMOTE)'." }
+  }
+  if ($delContent) {
+    # sioyek would otherwise keep pointing at a database that no longer exists.
+    $sp = Get-SioyekPaths
+    if (Test-Path -LiteralPath $sp.Prefs) {
+      $target = (Join-Path (Join-Path $root $AnnotDir) 'shared.db').Replace('\', '/')
+      $lines = @(Get-Content -LiteralPath $sp.Prefs -Encoding UTF8)
+      $keep = @($lines | Where-Object { -not ($_ -match '^\s*shared_database_path\s+(.*)$' -and $Matches[1].Trim().Replace('\', '/') -eq $target) })
+      if ($keep.Count -ne $lines.Count) { Write-Atomic $sp.Prefs (($keep -join "`n") + "`n"); Write-Ok 'sioyek uses its own annotation database again.' }
+    }
+  }
+  if ($onPath) {
+    [Environment]::SetEnvironmentVariable('Path', (($userPath -split ';' | Where-Object { $_ -and $_ -ne $root }) -join ';'), 'User')
+    Write-Ok "Removed $root from your user PATH."
+  }
+  if (Test-Path -LiteralPath $CfgDir) { Remove-Item -LiteralPath $CfgDir -Recurse -Force; Write-Ok "Removed $(Get-Tilde $CfgDir)" }
+  Set-Location -LiteralPath $env:USERPROFILE; [Environment]::CurrentDirectory = $env:USERPROFILE
+  $full = [IO.Path]::GetFullPath($root).TrimEnd('\')
+  if ($delContent -and $full -ne [IO.Path]::GetPathRoot($full).TrimEnd('\') -and $full -ne $env:USERPROFILE.TrimEnd('\')) {
+    Remove-Item -LiteralPath $root -Recurse -Force; Write-Ok "Deleted $(Get-Tilde $root)"
+  } else {
+    if (Test-Path -LiteralPath $logs) { Remove-Item -LiteralPath $logs -Recurse -Force }
+    foreach ($s in $scripts) { Remove-Item -LiteralPath $s -Force }
+    Write-Ok "Removed the scripts and logs; your files are still in $(Get-Tilde $root)"
+  }
+  Say; Write-Ok 'library is uninstalled from this device.'
+  return $true
 }
 
 # ---------------------------------------------------------------- first run --
@@ -1494,7 +1565,7 @@ function Show-MainMenu {
       'x' { Edit-Filters }
       't' { Show-Trash }
       'o' { Show-Logs }
-      'c' { Show-Settings }
+      'c' { Show-Settings; if ($Run.Quit) { return } }
       '?' { Show-Pager 'Help' (Get-HelpText) }
       'q' { Clear-Screen; return }
     }
@@ -1519,6 +1590,13 @@ function Invoke-Main {
   if ($Command -eq 'help') { Get-Help $Self -Detailed; return }
   if ($Command -eq 'version') { Say $Version; return }
   $configured = Read-Kv $CfgFile
+  if ($Command -eq 'uninstall') {
+    if (-not $Run.Interactive) { throw 'Uninstall asks questions - run it in a terminal.' }
+    Add-ScoopShimsToPath
+    if (Update-RclonePath) { Use-StableRcloneConfig; Unlock-Rclone }
+    $Run.LastRc = if (Uninstall-Library) { 0 } else { 1 }
+    return
+  }
   if ($Command -eq 'setup' -or -not $configured) {
     if (-not $Run.Interactive) { throw "Not configured yet - run 'library' in a terminal first." }
     Start-FirstRun
