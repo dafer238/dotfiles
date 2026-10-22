@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  library - interactive Google Drive <-> local library sync (books, papers, sioyek annotations).
+  library - interactive Google Drive <-> local library sync (books, papers, sioyek and KOReader annotations).
 .DESCRIPTION
   library                  interactive menu (vim keys: j/k move, enter/l open, h/esc back, q quit)
   library status           print sync status and exit
@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.2.0'
+$Version = '1.3.0'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'
@@ -31,6 +31,8 @@ $StateFile = Join-Path $CfgDir 'state'
 $FilterFile = Join-Path $CfgDir 'filters.rclone'
 $ManifestFile = Join-Path $CfgDir 'manifest'
 $AnnotDir = 'sioyek'
+# KOReader's book metadata, kept in sync by library.sh on Android/Linux (KOReader has no Windows build).
+$KoDir = 'koreader'
 $MarkerDir = '.library-sync'
 # logs\ and .trash\ are per-device: never selectable as a synced folder.
 function Test-SyncFolder([string]$f) { return @('logs', '.trash') -notcontains $f.Split('/')[0] }
@@ -373,6 +375,8 @@ function Build-Filters {
     $ef = ConvertTo-GlobEscaped $f
     if ($f -ceq $AnnotDir -or $f.StartsWith("$AnnotDir/", [StringComparison]::Ordinal)) {
       foreach ($r in "- /$ef/**.db-journal", "- /$ef/**.db-wal", "- /$ef/**.db-shm", "+ /$ef/**") { $l.Add($r) }
+    } elseif ($f -ceq $KoDir -or $f.StartsWith("$KoDir/", [StringComparison]::Ordinal)) {
+      foreach ($r in "- /$ef/**.old", "- /$ef/**.tmp", "+ /$ef/**") { $l.Add($r) }
     } elseif ($useTypes -and $Cfg.FILTER_MODE -eq 'exclude') {
       foreach ($e in $Cfg.FILTER_EXT) { $l.Add("- /$ef/**.$e") }
       $l.Add("+ /$ef/**")
@@ -1004,7 +1008,7 @@ function Edit-Filters {
   while ($true) {
     $n = $list.Count
     $sb = New-Object Text.StringBuilder
-    [void]$sb.Append(" ${CB}File-type filter for this device$C0  ${CD}(sioyek annotations are always synced)$C0`n`n mode: ")
+    [void]$sb.Append(" ${CB}File-type filter for this device$C0  ${CD}(sioyek and KOReader annotations are always synced)$C0`n`n mode: ")
     foreach ($m in 'none', 'exclude', 'include') {
       if ($m -eq $mode) { [void]$sb.Append(" $CRV $($labels[$m]) $C0") } else { [void]$sb.Append(" $CD $($labels[$m]) $C0") }
     }
@@ -1677,10 +1681,12 @@ Operations
   sioyek's shared.db is merged row by row on Pull and Merge (needs sqlite3):
            highlights/bookmarks added or deleted on either side since the last
            sync are kept or deleted on both. Push uploads this device's copy.
+  KOReader's book metadata (koreader\ folder) is merged by library.sh on
+           Android and Linux; here it is synced as plain files.
 
 Only the selected folders are synced; logs\, .trash\ and the scripts stay local.
-The file-type filter is per device (e.g. PDFs only on a tablet); sioyek's
-annotation folder is never filtered. Each sync leaves a marker in
+The file-type filter is per device (e.g. PDFs only on a tablet); the sioyek
+and KOReader annotation folders are never filtered. Each sync leaves a marker in
 $(Get-RPath $MarkerDir)/ so Status shows when other devices last synced.
 
 Command line:  library status | pull | push | merge  [-Yes] [-Force]
