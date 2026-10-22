@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.1.2
+VERSION=1.2.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -461,7 +461,7 @@ apply_renames() {
   done <"$TMP/renames"
 }
 
-set_last() { printf -v "LAST_${1^^}" '%s' "$(now_iso)"; save_state; save_manifest; write_marker; }
+set_last() { printf -v "LAST_${1^^}" '%s' "$(now_iso)"; save_state; save_manifest; save_sioyek_base; write_marker; }
 
 devices_lines() {
   local h pu pl mark lp
@@ -683,6 +683,8 @@ view_diff() {
 # ----------------------------------------------------------------- sync --
 sioyek_running() { have pgrep && pgrep -x sioyek >/dev/null 2>&1; }
 
+annot_db_changed() { awk -F'\t' -v p="$ANNOT_DIR/shared.db" '$2 == p && ($1 == "rnew" || $1 == "lnew" || $1 == "size") {f = 1} END {exit !f}' "$TMP/diff"; }
+
 annot_changes() { awk -F'\t' -v d="$ANNOT_DIR/" '$1 != "same" && index($2, d) == 1 {f = 1} END {exit !f}' "$TMP/diff"; }
 
 write_marker() {
@@ -715,8 +717,9 @@ run_rclone() { # LOGFILE ARGS...
 
 # do_sync pull|push|merge [assume_yes] [force]
 do_sync() {
-  local op=$1 yes=${2:-0} force=${3:-0} a b c d over del dest_n ts log rc=0 title ren unk revert names=b
+  local op=$1 yes=${2:-0} force=${3:-0} a b c d over del dest_n ts log rc=0 title ren unk revert names=b merge_db=0
   [[ $DIFF_READY == 1 ]] || compute_diff || return 1
+  [[ $op != push ]] && annot_db_changed && merge_db=1
   ren=${CNT[ren]}
   unk=$(awk -F'\t' '$3 == ""' "$TMP/renames" | wc -l)
   case $op in
@@ -755,6 +758,7 @@ do_sync() {
       ((over)) && printf '   %s! %5d%s  destination files are NEWER and will be overwritten (old copy kept in trash)\n' "$CR" "$over" "$C0"
       ((del)) && printf '   %s✘ %5d%s  files missing from the source will be removed (moved to trash)\n' "$CR" "$del" "$C0"
     fi
+    ((merge_db)) && have sqlite3 && printf '   %s⇄      %s  sioyek annotations from both sides are merged, not overwritten\n' "$CBL" "$C0"
     if ((a + b + over + del + ren == 0)); then
       ok "Already in sync - nothing to $op."
       set_last "$op"
@@ -784,6 +788,15 @@ do_sync() {
       ask "Type 'delete' to continue: "; [[ $REPLY == delete ]] || { info "Cancelled."; return 1; }
     fi
   fi
+  # Replacing shared.db under a running sioyek loses whatever it writes back afterwards.
+  if [[ $op != push ]] && annot_changes && sioyek_running; then
+    warn "sioyek is still running - replacing its annotation database now can lose annotations."
+    if ((yes)); then
+      ((force)) || { err "Close sioyek, or re-run with --force."; return 1; }
+    else
+      yesno " Continue anyway?" n || { info "Cancelled."; return 1; }
+    fi
+  fi
   build_filters || return 1
   base_flags
   ts=$(date +%Y-%m-%d_%H%M%S)
@@ -793,6 +806,11 @@ do_sync() {
   [[ -n $BWLIMIT ]] && X+=(--bwlimit "$BWLIMIT")
   checksum_mode && X+=(--checksum)
   mkdir -p -- "$LIBRARY_ROOT"
+  if ((merge_db)) && ! sioyek_merge "$LIBRARY_ROOT/.trash/$ts" "$REMOTE:$REMOTE_TRASH/$ts"; then
+    DIFF_READY=0
+    err "${op^} cancelled, so neither annotation database gets overwritten."
+    return 1
+  fi
   case $op in
     pull) run_rclone "$log" sync "${X[@]}" --track-renames --backup-dir "$LIBRARY_ROOT/.trash/$ts" -- "$(rpath)" "$LIBRARY_ROOT"; rc=$? ;;
     push) run_rclone "$log" sync "${X[@]}" --track-renames --backup-dir "$REMOTE:$REMOTE_TRASH/$ts" -- "$LIBRARY_ROOT" "$(rpath)"; rc=$? ;;
@@ -1065,10 +1083,22 @@ check_deps() {
     if ((TERMUX)); then yesno " Update it with 'pkg upgrade rclone'?" y && confirm_run pkg upgrade -y rclone
     else yesno " Install the latest rclone with the official installer?" n && install_rclone_official; fi
   fi
-  if ((SIOYEK_ASKED == 0 && !TERMUX)) && ! sioyek_installed; then
-    yesno "sioyek (PDF reader whose annotations this tool syncs) is not installed. Install it?" y && install_sioyek
+  if ((SIOYEK_ASKED == 0 && !TERMUX)); then
+    ! sioyek_installed && yesno "sioyek (PDF reader whose annotations this tool syncs) is not installed. Install it?" y && install_sioyek
+    ! have sqlite3 &&
+      yesno "sqlite3 (lets Pull/Merge combine sioyek annotations made on different devices) is not installed. Install it?" y && install_sqlite
     SIOYEK_ASKED=1; save_config
   fi
+}
+
+install_sqlite() {
+  case $(pkg_manager) in
+    pacman) confirm_run as_root pacman -S --needed sqlite ;;
+    apt) confirm_run as_root apt-get install -y sqlite3 ;;
+    dnf) confirm_run as_root dnf install -y sqlite ;;
+    zypper) confirm_run as_root zypper install -y sqlite3 ;;
+    *) err "Install sqlite3 with your package manager."; return 1 ;;
+  esac
 }
 
 # --------------------------------------------------------------- remote --
@@ -1177,10 +1207,99 @@ test_remote() {
 # --------------------------------------------------------------- sioyek --
 sioyek_paths() {
   local cfg=${XDG_CONFIG_HOME:-$HOME/.config} data=${XDG_DATA_HOME:-$HOME/.local/share}
-  SY_PREFS=$cfg/sioyek/prefs_user.config SY_DB=$data/sioyek/shared.db
+  SY_PREFS=$cfg/sioyek/prefs_user.config SY_DB=$data/sioyek/shared.db SY_FLATPAK=0
   if ! have sioyek && have flatpak && flatpak info com.github.ahrm.sioyek >/dev/null 2>&1; then
     SY_PREFS=$HOME/.var/app/com.github.ahrm.sioyek/config/sioyek/prefs_user.config
     SY_DB=$HOME/.var/app/com.github.ahrm.sioyek/data/sioyek/shared.db
+    SY_FLATPAK=1
+  fi
+}
+
+# Run against a copy of the local shared.db, this prints the SQL that merges r (remote) into it,
+# given b (the database as it was after the last sync). Rows are compared by content (every column
+# but the rowid key): added on the remote = r EXCEPT b, deleted on the remote = b EXCEPT r. On a
+# unique-key clash the local row wins, except in opened_books, where the latest reading position
+# wins. Keep identical to $SioyekMergeSql in library.ps1.
+read -r -d '' SIOYEK_MERGE_SQL <<'EOF'
+WITH c AS (
+  SELECT t.name AS tbl,
+    group_concat('"' || p.name || '"', ',') AS cols,
+    group_concat('x."' || p.name || '" IS d."' || p.name || '"', ' AND ') AS eq
+  FROM sqlite_master AS t, pragma_table_info(t.name) AS p
+  WHERE t.type = 'table' AND t.name NOT LIKE 'sqlite%' AND p.pk = 0
+  GROUP BY t.name)
+SELECT
+  printf('CREATE TABLE IF NOT EXISTS b."%s" AS SELECT * FROM main."%s" WHERE 0;', tbl, tbl) || char(10) ||
+  printf('DELETE FROM main."%s" AS x WHERE EXISTS (SELECT 1 FROM (SELECT %s FROM b."%s" EXCEPT SELECT %s FROM r."%s") AS d WHERE %s);',
+    tbl, cols, tbl, cols, tbl, eq) || char(10) ||
+  printf('INSERT OR IGNORE INTO main."%s" (%s) SELECT %s FROM r."%s" EXCEPT SELECT %s FROM b."%s" EXCEPT SELECT %s FROM main."%s";',
+    tbl, cols, cols, tbl, cols, tbl, cols, tbl) ||
+  CASE WHEN tbl = 'opened_books' AND cols LIKE '%"path"%' AND cols LIKE '%"last_access_time"%' THEN char(10) ||
+    printf('UPDATE main.opened_books AS x SET (%s) = (SELECT %s FROM r.opened_books AS d WHERE d.path IS x.path) WHERE EXISTS (SELECT 1 FROM r.opened_books AS d WHERE d.path IS x.path AND d.last_access_time > x.last_access_time);',
+      cols, cols)
+  ELSE '' END
+FROM c;
+EOF
+
+db_schema() { sqlite3 -bail -batch "$1" "SELECT type || ' ' || name || ' ' || sql FROM sqlite_master WHERE name NOT LIKE 'sqlite%' ORDER BY name;" 2>/dev/null; }
+sql_string() { local s=$1; printf "'%s'" "${s//\'/\'\'}"; }
+sioyek_base() { printf '%s/sioyek-base.db' "$CFG_DIR"; }
+
+# After every successful sync the local shared.db equals the remote one: keep it as the merge base.
+save_sioyek_base() {
+  [[ " ${FOLDERS[*]} " == *" $ANNOT_DIR "* && -f $LIBRARY_ROOT/$ANNOT_DIR/shared.db ]] || return 0
+  cp -p -- "$LIBRARY_ROOT/$ANNOT_DIR/shared.db" "$(sioyek_base)"
+}
+
+# sioyek_merge LOCAL_TRASH REMOTE_TRASH
+# Pull/Merge with shared.db changed: merge the remote database into the local one and upload the
+# result, so the following rclone run finds both sides identical. Returns 1 only on failure; when
+# it can't merge, the newer shared.db wins as before.
+sioyek_merge() {
+  local rel=$ANNOT_DIR/shared.db ldb=$LIBRARY_ROOT/$ANNOT_DIR/shared.db base b schema gen
+  local remote=$TMP/remote-shared.db merged=$TMP/merged-shared.db
+  base=$(sioyek_base) b=$TMP/base-shared.db
+  # sioyek doesn't run on Android, so its copy never has changes of its own.
+  ((TERMUX)) && return 0
+  [[ -f $ldb ]] || return 0
+  # Unchanged here since the last sync: the remote copy already holds everything.
+  [[ -f $base ]] && cmp -s -- "$ldb" "$base" && return 0
+  if ! have sqlite3; then
+    warn "sqlite3 is not installed, so the newer shared.db replaces the other (Settings → Dependencies installs it)."
+    return 0
+  fi
+  info "Merging sioyek annotations from both sides…"
+  base_flags
+  rclone copyto "${BASE[@]}" -- "$(rpath "$rel")" "$remote" </dev/null 2>"$TMP/merge.err" ||
+    { err "Could not download $rel from the remote:"; rclone_error "$TMP/merge.err"; return 1; }
+  schema=$(db_schema "$ldb")
+  if [[ -z $schema || $schema != "$(db_schema "$remote")" ]]; then
+    warn "The two shared.db files come from different sioyek versions and cannot be merged - the newer one wins."
+    return 0
+  fi
+  # Without a usable base every row on either side counts as new: nothing gets deleted.
+  [[ -f $base ]] && cp -- "$base" "$b" && [[ $(db_schema "$b") == "$schema" ]] || b=:memory:
+  cp -- "$ldb" "$merged"
+  if ! gen=$(sqlite3 -bail -batch "$merged" <<<"$SIOYEK_MERGE_SQL" 2>"$TMP/merge.err") ||
+    ! printf 'ATTACH %s AS r;\nATTACH %s AS b;\nBEGIN;\n%s\nCOMMIT;\n' "$(sql_string "$remote")" "$(sql_string "$b")" "$gen" |
+    sqlite3 -bail -batch "$merged" 2>"$TMP/merge.err"; then
+    err "Merging the annotation databases failed: $(cat -- "$TMP/merge.err")"; return 1
+  fi
+  mkdir -p -- "$1/$ANNOT_DIR" && cp -p -- "$ldb" "$1/$ANNOT_DIR/shared.db" && cp -- "$merged" "$ldb" ||
+    { err "Could not replace $(tildify "$ldb")."; return 1; }
+  rclone copyto "${BASE[@]}" --backup-dir "$2/$ANNOT_DIR" -- "$ldb" "$(rpath "$rel")" </dev/null 2>"$TMP/merge.err" ||
+    { err "Merged locally, but uploading $rel failed:"; rclone_error "$TMP/merge.err"; return 1; }
+  ok "Merged sioyek annotations (previous copies kept in trash)."; log_line "merged sioyek annotations"
+}
+
+# The flatpak sandbox can't see the library unless allowed to; sioyek would then silently fall
+# back to an empty database. Idempotent, so it is safe to run on every setup.
+sioyek_flatpak_access() {
+  ((SY_FLATPAK)) || return 0
+  if flatpak override --user --filesystem="$LIBRARY_ROOT" com.github.ahrm.sioyek 2>/dev/null; then
+    ok "Allowed the sioyek flatpak to access $(tildify "$LIBRARY_ROOT")"
+  else
+    warn "Could not grant the sioyek flatpak access - run: flatpak override --user --filesystem=$LIBRARY_ROOT com.github.ahrm.sioyek"
   fi
 }
 
@@ -1194,7 +1313,7 @@ sioyek_setup() {
   say " current db : ${current:-$(tildify "$SY_DB") (default)}"
   say " library db : $(tildify "$target")"
   say
-  if [[ $current == "$target" ]]; then ok "Already pointing at the library."; pause; return; fi
+  if [[ $current == "$target" ]]; then ok "Already pointing at the library."; sioyek_flatpak_access; pause; return; fi
   yesno " Point sioyek's shared.db at the library folder?" y || return
   if sioyek_running; then warn "Close sioyek first."; pause; return; fi
   mkdir -p -- "$(dirname -- "$target")" "$(dirname -- "$SY_PREFS")"
@@ -1209,8 +1328,10 @@ sioyek_setup() {
   [[ -f $SY_PREFS ]] && cp -p -- "$SY_PREFS" "$SY_PREFS.bak"
   { grep -vE '^[[:space:]]*shared_database_path' "$SY_PREFS" 2>/dev/null; say "shared_database_path $target"; } | write_atomic "$SY_PREFS"
   ok "Updated $(tildify "$SY_PREFS") (backup: .bak)"
+  sioyek_flatpak_access
   if [[ " ${FOLDERS[*]} " != *" $ANNOT_DIR "* ]]; then FOLDERS+=("$ANNOT_DIR"); save_config; ok "Added '$ANNOT_DIR' to synced folders."; fi
-  warn "Annotations merge per file, not per highlight: if two devices annotate before syncing, the newer shared.db wins."
+  if have sqlite3; then info "Pull and Merge combine annotations made on different devices; Push overwrites the remote shared.db with this one."
+  else warn "sqlite3 is not installed: if two devices annotate before syncing, the newer shared.db wins (Settings → Dependencies installs it)."; fi
   pause
 }
 
@@ -1242,7 +1363,7 @@ settings_menu() {
          if [[ $f == /* ]]; then LIBRARY_ROOT=${f%/}; mkdir -p -- "$LIBRARY_ROOT/logs"; DIFF_READY=0; save_config
            warn "Existing files were not moved. Move them yourself or pull into the new folder."; pause; fi ;;
       4) sioyek_setup ;;
-      5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; pause ;;
+      5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"; pause ;;
       6) tuning ;;
       7) cls
          f=$(rclone_minor)
@@ -1411,6 +1532,9 @@ Operations
            Renamed files get the new name on both sides (the side that renamed
            since the last sync wins).
   Renames/moves are done as moves (server-side on Drive), never as re-transfers.
+  sioyek's shared.db is merged row by row on Pull and Merge (needs sqlite3):
+           highlights/bookmarks added or deleted on either side since the last
+           sync are kept or deleted on both. Push uploads this device's copy.
 
 Only the selected folders are synced; logs/, .trash/ and the scripts stay local.
 The file-type filter is per device (e.g. PDFs only on a tablet); sioyek's

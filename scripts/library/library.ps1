@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.1.0'
+$Version = '1.2.0'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'
@@ -59,7 +59,7 @@ $State = @{ LAST_PULL = ''; LAST_PUSH = ''; LAST_MERGE = '' }
 $Run = @{
   DiffReady = $false; RemoteMissing = $false; Rows = $null; Cnt = @{}; LocalN = 0; LocalB = 0; RemoteN = 0; RemoteB = 0
   Markers = ''; About = ''; DiffTime = ''; MenuPos = @{}; DirCache = (New-Object Collections.Hashtable ([StringComparer]::Ordinal))
-  Rclone = $null; Tmp = $null; KeyQueue = $null; Interactive = $false; LastRc = 0; MenuKey = ''; ViewAction = ''; RemoteOk = $false; ConfFile = ''; Prefetch = $null; Quit = $false
+  Rclone = $null; Sqlite = $null; Tmp = $null; KeyQueue = $null; Interactive = $false; LastRc = 0; MenuKey = ''; ViewAction = ''; RemoteOk = $false; ConfFile = ''; Prefetch = $null; Quit = $false
 }
 
 # ------------------------------------------------------------------ colours --
@@ -753,6 +753,11 @@ function Show-Diff([string]$start = 'changes') {
 # --------------------------------------------------------------------- sync --
 function Test-SioyekRunning { return [bool](Get-Process -Name sioyek -ErrorAction SilentlyContinue) }
 
+function Test-AnnotDbChanged {
+  foreach ($r in $Run.Rows) { if ($r.P -ceq "$AnnotDir/shared.db" -and @('rnew', 'lnew', 'size') -contains $r.C) { return $true } }
+  return $false
+}
+
 function Test-AnnotChanges {
   foreach ($r in $Run.Rows) { if ($r.C -ne 'same' -and $r.P.StartsWith("$AnnotDir/", [StringComparison]::Ordinal)) { return $true } }
   return $false
@@ -784,7 +789,7 @@ function Invoke-RcloneLive([string]$log, [string[]]$argv) {
   $Run.LastRc = $LASTEXITCODE
 }
 
-function Set-Last([string]$op) { $State["LAST_$($op.ToUpperInvariant())"] = Get-NowIso; Save-State; Save-Manifest; Write-Marker }
+function Set-Last([string]$op) { $State["LAST_$($op.ToUpperInvariant())"] = Get-NowIso; Save-State; Save-Manifest; Save-SioyekBase; Write-Marker }
 
 # Invoke-Sync pull|push|merge  -> $Run.LastRc
 function Invoke-Sync([string]$op, [bool]$assumeYes = $false, [bool]$force = $false) {
@@ -796,6 +801,7 @@ function Invoke-Sync([string]$op, [bool]$assumeYes = $false, [bool]$force = $fal
     if (-not $r.D) { $unk++ } elseif (($op -eq 'pull' -and $r.D -eq 'local') -or ($op -eq 'push' -and $r.D -eq 'remote')) { $revert++ }
   }
   $root = Get-Tilde $Cfg.LIBRARY_ROOT
+  $mergeDb = $op -ne 'push' -and (Test-AnnotDbChanged)
   switch ($op) {
     'pull' { $a = $c.radd; $b = $c.rnew + $c.size; $over = $c.lnew; $del = $c.ladd; $destN = $Run.LocalN; $title = "Pull  $(Get-RPath) $Arrow $root" }
     'push' { $a = $c.ladd; $b = $c.lnew + $c.size; $over = $c.rnew; $del = $c.radd; $destN = $Run.RemoteN; $title = "Push  $root $Arrow $(Get-RPath)" }
@@ -826,6 +832,7 @@ function Invoke-Sync([string]$op, [bool]$assumeYes = $false, [bool]$force = $fal
       if ($over) { Say ('   {0}! {1,5}{2}  destination files are NEWER and will be overwritten (old copy kept in trash)' -f $CR, $over, $C0) }
       if ($del) { Say ('   {0}{1} {2,5}{3}  files missing from the source will be removed (moved to trash)' -f $CR, $Cross, $del, $C0) }
     }
+    if ($mergeDb -and $Run.Sqlite) { Say ('   {0}{1}      {2}  sioyek annotations from both sides are merged, not overwritten' -f $CBL, $Sync, $C0) }
     if ($a + $b + $over + $del + $ren -eq 0) {
       Write-Ok "Already in sync - nothing to $op."
       Set-Last $op; $Run.LastRc = 0; return
@@ -850,6 +857,13 @@ function Invoke-Sync([string]$op, [bool]$assumeYes = $false, [bool]$force = $fal
       if (-not $force) { Write-Err 'Refusing without -Force.'; return }
     } elseif ((Read-Line "Type 'delete' to continue") -cne 'delete') { Write-Info 'Cancelled.'; return }
   }
+  # Replacing shared.db under a running sioyek loses whatever it writes back afterwards.
+  if ($op -ne 'push' -and (Test-AnnotChanges) -and (Test-SioyekRunning)) {
+    Write-Warn 'sioyek is still running - replacing its annotation database now can lose annotations.'
+    if ($assumeYes) {
+      if (-not $force) { Write-Err 'Close sioyek, or re-run with -Force.'; return }
+    } elseif (-not (Read-YesNo ' Continue anyway?' 'n')) { Write-Info 'Cancelled.'; return }
+  }
   if (-not (Build-Filters)) { return }
   $ts = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
   $log = Join-Path (Join-Path $Cfg.LIBRARY_ROOT 'logs') "rclone-$op-$((Get-Date).ToString('yyyy-MM')).log"
@@ -858,6 +872,11 @@ function Invoke-Sync([string]$op, [bool]$assumeYes = $false, [bool]$force = $fal
   if (-not (Test-Path -LiteralPath $Cfg.LIBRARY_ROOT)) { $null = New-Item -ItemType Directory -Force -Path $Cfg.LIBRARY_ROOT }
   $localTrash = Join-Path (Join-Path $Cfg.LIBRARY_ROOT '.trash') $ts
   $remoteTrash = "$($Cfg.REMOTE):$($Cfg.REMOTE_TRASH)/$ts"
+  if ($mergeDb -and (Merge-SioyekDb $localTrash $remoteTrash) -eq 'fail') {
+    $Run.DiffReady = $false
+    Write-Err "$op cancelled, so neither annotation database gets overwritten."
+    return
+  }
   switch ($op) {
     'pull' { Invoke-RcloneLive $log (@('sync') + $x + @('--track-renames', '--backup-dir', $localTrash, '--', (Get-RPath), $Cfg.LIBRARY_ROOT)) }
     'push' { Invoke-RcloneLive $log (@('sync') + $x + @('--track-renames', '--backup-dir', $remoteTrash, '--', $Cfg.LIBRARY_ROOT, (Get-RPath))) }
@@ -1137,10 +1156,18 @@ function Test-Dependencies {
     Write-Warn "rclone v1.$m is old (v1.$MinRcloneMinor+ recommended)."
     if ((Test-Scoop) -and (Read-YesNo ' Update it with scoop?' 'y')) { Invoke-Scoop @('update', 'rclone') }
   }
-  if ($Cfg.SIOYEK_ASKED -eq 0 -and -not (Test-Sioyek)) {
-    if (Read-YesNo 'sioyek (PDF reader whose annotations this tool syncs) is not installed. Install it?' 'y') { Install-Sioyek }
+  if ($Cfg.SIOYEK_ASKED -eq 0) {
+    if (-not (Test-Sioyek) -and (Read-YesNo 'sioyek (PDF reader whose annotations this tool syncs) is not installed. Install it?' 'y')) { Install-Sioyek }
+    if (-not (Update-SqlitePath) -and
+      (Read-YesNo 'sqlite3 (lets Pull/Merge combine sioyek annotations made on different devices) is not installed. Install it?' 'y')) { Install-Sqlite }
     $Cfg.SIOYEK_ASKED = 1; Save-Config
   }
+}
+
+function Install-Sqlite {
+  Install-Scoop
+  if (Test-Scoop) { Invoke-Scoop @('install', 'sqlite') }
+  [void](Update-SqlitePath)
 }
 
 # ------------------------------------------------------------------- remote --
@@ -1258,20 +1285,135 @@ function Set-Remote {
 }
 
 # ------------------------------------------------------------------- sioyek --
+# Prefs is the file sioyek reads. Under scoop it is hard-linked to a copy in scoop\persist (Extra),
+# which scoop re-links on every update, so both must carry the setting.
 function Get-SioyekPaths {
   $app = Join-Path (Get-ScoopRoot) 'apps\sioyek\current'
   if (Test-Path -LiteralPath (Join-Path $app 'sioyek.exe')) {
-    $persist = Join-Path (Get-ScoopRoot) 'persist\sioyek'
-    $prefs = if (Test-Path -LiteralPath $persist) { Join-Path $persist 'prefs_user.config' } else { Join-Path $app 'prefs_user.config' }
-    return @{ Prefs = $prefs; Db = (Join-Path $app 'shared.db') }
+    $persist = Join-Path (Get-ScoopRoot) 'persist\sioyek\prefs_user.config'
+    $extra = if (Test-Path -LiteralPath $persist) { @($persist) } else { @() }
+    return @{ Prefs = (Join-Path $app 'prefs_user.config'); Extra = $extra; Db = (Join-Path $app 'shared.db') }
   }
   $exe = Get-Command sioyek.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($exe) {
     $d = Split-Path -Parent $exe.Source
-    if (Test-Path -LiteralPath (Join-Path $d 'prefs.config')) { return @{ Prefs = (Join-Path $d 'prefs_user.config'); Db = (Join-Path $d 'shared.db') } }
+    if (Test-Path -LiteralPath (Join-Path $d 'prefs.config')) { return @{ Prefs = (Join-Path $d 'prefs_user.config'); Extra = @(); Db = (Join-Path $d 'shared.db') } }
   }
   $d = Join-Path $env:APPDATA 'sioyek'
-  return @{ Prefs = (Join-Path $d 'prefs_user.config'); Db = (Join-Path $d 'shared.db') }
+  return @{ Prefs = (Join-Path $d 'prefs_user.config'); Extra = @(); Db = (Join-Path $d 'shared.db') }
+}
+
+# Overwrites in place, not via Write-Atomic: replacing the file would break scoop's hard link and
+# sioyek would keep reading the old copy.
+function Write-SioyekPrefs($sp, [string[]]$lines) {
+  $text = ($lines -join "`n") + "`n"
+  foreach ($f in @($sp.Prefs) + @($sp.Extra)) { [IO.File]::WriteAllText($f, $text, $Utf8) }
+}
+
+# Run against a copy of the local shared.db, this prints the SQL that merges r (remote) into it,
+# given b (the database as it was after the last sync). Rows are compared by content (every column
+# but the rowid key): added on the remote = r EXCEPT b, deleted on the remote = b EXCEPT r. On a
+# unique-key clash the local row wins, except in opened_books, where the latest reading position
+# wins. Keep identical to SIOYEK_MERGE_SQL in library.sh.
+$SioyekMergeSql = @'
+WITH c AS (
+  SELECT t.name AS tbl,
+    group_concat('"' || p.name || '"', ',') AS cols,
+    group_concat('x."' || p.name || '" IS d."' || p.name || '"', ' AND ') AS eq
+  FROM sqlite_master AS t, pragma_table_info(t.name) AS p
+  WHERE t.type = 'table' AND t.name NOT LIKE 'sqlite%' AND p.pk = 0
+  GROUP BY t.name)
+SELECT
+  printf('CREATE TABLE IF NOT EXISTS b."%s" AS SELECT * FROM main."%s" WHERE 0;', tbl, tbl) || char(10) ||
+  printf('DELETE FROM main."%s" AS x WHERE EXISTS (SELECT 1 FROM (SELECT %s FROM b."%s" EXCEPT SELECT %s FROM r."%s") AS d WHERE %s);',
+    tbl, cols, tbl, cols, tbl, eq) || char(10) ||
+  printf('INSERT OR IGNORE INTO main."%s" (%s) SELECT %s FROM r."%s" EXCEPT SELECT %s FROM b."%s" EXCEPT SELECT %s FROM main."%s";',
+    tbl, cols, cols, tbl, cols, tbl, cols, tbl) ||
+  CASE WHEN tbl = 'opened_books' AND cols LIKE '%"path"%' AND cols LIKE '%"last_access_time"%' THEN char(10) ||
+    printf('UPDATE main.opened_books AS x SET (%s) = (SELECT %s FROM r.opened_books AS d WHERE d.path IS x.path) WHERE EXISTS (SELECT 1 FROM r.opened_books AS d WHERE d.path IS x.path AND d.last_access_time > x.last_access_time);',
+      cols, cols)
+  ELSE '' END
+FROM c;
+'@
+
+function Update-SqlitePath {
+  $c = Get-Command sqlite3 -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  $Run.Sqlite = if ($c) { $c.Source } else { $null }
+  return [bool]$Run.Sqlite
+}
+
+# SQL goes in on stdin as UTF-8 bytes (Windows PowerShell can't set the stdin encoding).
+function Invoke-Sqlite([string]$db, [string]$sql) {
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = $Run.Sqlite
+  $psi.Arguments = '-bail -batch ' + (ConvertTo-QuotedArg $db)
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = $Utf8; $psi.StandardErrorEncoding = $Utf8
+  $p = [Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync(); $err = $p.StandardError.ReadToEndAsync()
+  $b = $Utf8.GetBytes($sql); $p.StandardInput.BaseStream.Write($b, 0, $b.Length); $p.StandardInput.Close()
+  $p.WaitForExit()
+  return [pscustomobject]@{ Code = $p.ExitCode; Out = $out.Result; Err = $err.Result }
+}
+
+function ConvertTo-SqlString([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
+
+function Get-DbSchema([string]$db) {
+  $r = Invoke-Sqlite $db "SELECT type || ' ' || name || ' ' || sql FROM sqlite_master WHERE name NOT LIKE 'sqlite%' ORDER BY name;"
+  if ($r.Code) { return '' }
+  return $r.Out
+}
+
+function Get-SioyekBase { return Join-Path $CfgDir 'sioyek-base.db' }
+
+# After every successful sync the local shared.db equals the remote one: keep it as the merge base.
+function Save-SioyekBase {
+  if (@($Cfg.FOLDERS) -cnotcontains $AnnotDir) { return }
+  $db = Join-Path (Join-Path $Cfg.LIBRARY_ROOT $AnnotDir) 'shared.db'
+  if (Test-Path -LiteralPath $db) { Copy-Item -LiteralPath $db -Destination (Get-SioyekBase) -Force }
+}
+
+# Pull/Merge with shared.db changed: merge the remote database into the local one and upload the
+# result, so the following rclone run finds both sides identical. Returns merged|skip|fail;
+# on skip, the newer shared.db wins as before.
+function Merge-SioyekDb([string]$localTrash, [string]$remoteTrash) {
+  $rel = "$AnnotDir/shared.db"
+  $local = Join-Path (Join-Path $Cfg.LIBRARY_ROOT $AnnotDir) 'shared.db'
+  $base = Get-SioyekBase
+  $hasBase = Test-Path -LiteralPath $base
+  if (-not (Test-Path -LiteralPath $local)) { return 'skip' }
+  # Unchanged here since the last sync: the remote copy already holds everything.
+  if ($hasBase -and (Get-FileHash -LiteralPath $local).Hash -eq (Get-FileHash -LiteralPath $base).Hash) { return 'skip' }
+  if (-not $Run.Sqlite) {
+    Write-Warn 'sqlite3 is not installed, so the newer shared.db replaces the other (Settings -> Dependencies installs it).'
+    return 'skip'
+  }
+  Write-Info "Merging sioyek annotations from both sides$Ell"
+  $remote = Join-Path $Run.Tmp 'remote-shared.db'; $merged = Join-Path $Run.Tmp 'merged-shared.db'; $b = Join-Path $Run.Tmp 'base-shared.db'
+  $r = Invoke-Rc (@('copyto') + (Get-BaseFlags) + @('--', (Get-RPath $rel), $remote))
+  if ($r.Code) { Write-Err "Could not download $rel from the remote:"; Show-RcloneError $r.Err; return 'fail' }
+  $schema = Get-DbSchema $local
+  if (-not $schema -or $schema -cne (Get-DbSchema $remote)) {
+    Write-Warn 'The two shared.db files come from different sioyek versions and cannot be merged - the newer one wins.'
+    return 'skip'
+  }
+  # Without a usable base every row on either side counts as new: nothing gets deleted.
+  if ($hasBase) { Copy-Item -LiteralPath $base -Destination $b -Force }
+  if (-not $hasBase -or (Get-DbSchema $b) -cne $schema) { $b = ':memory:' }
+  Copy-Item -LiteralPath $local -Destination $merged -Force
+  $gen = Invoke-Sqlite $merged $SioyekMergeSql
+  if ($gen.Code -eq 0) {
+    $gen = Invoke-Sqlite $merged ("ATTACH {0} AS r;`nATTACH {1} AS b;`nBEGIN;`n{2}`nCOMMIT;`n" -f (ConvertTo-SqlString $remote), (ConvertTo-SqlString $b), $gen.Out)
+  }
+  if ($gen.Code) { Write-Err "Merging the annotation databases failed: $($gen.Err.Trim())"; return 'fail' }
+  $null = New-Item -ItemType Directory -Force -Path (Join-Path $localTrash $AnnotDir)
+  Copy-Item -LiteralPath $local -Destination (Join-Path (Join-Path $localTrash $AnnotDir) 'shared.db') -Force
+  Copy-Item -LiteralPath $merged -Destination $local -Force
+  $r = Invoke-Rc (@('copyto') + (Get-BaseFlags) + @('--backup-dir', "$remoteTrash/$AnnotDir", '--', $local, (Get-RPath $rel)))
+  if ($r.Code) { Write-Err "Merged locally, but uploading $rel failed:"; Show-RcloneError $r.Err; return 'fail' }
+  Write-Ok 'Merged sioyek annotations (previous copies kept in trash).'; Add-LogLine 'merged sioyek annotations'
+  return 'merged'
 }
 
 function Set-SioyekDb {
@@ -1307,10 +1449,11 @@ function Set-SioyekDb {
     $lines = @(Get-Content -LiteralPath $sp.Prefs -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*shared_database_path' })
   }
   $lines += "shared_database_path $targetCfg"
-  Write-Atomic $sp.Prefs (($lines -join "`n") + "`n")
+  Write-SioyekPrefs $sp $lines
   Write-Ok "Updated $(Get-Tilde $sp.Prefs) (backup: .bak)"
   if (@($Cfg.FOLDERS) -cnotcontains $AnnotDir) { $Cfg.FOLDERS = @($Cfg.FOLDERS) + $AnnotDir; Save-Config; Write-Ok "Added '$AnnotDir' to synced folders." }
-  Write-Warn 'Annotations merge per file, not per highlight: if two devices annotate before syncing, the newer shared.db wins.'
+  if ($Run.Sqlite) { Write-Info 'Pull and Merge combine annotations made on different devices; Push overwrites the remote shared.db with this one.' }
+  else { Write-Warn 'sqlite3 is not installed: if two devices annotate before syncing, the newer shared.db wins (Settings -> Dependencies installs it).' }
   Wait-AnyKey
 }
 
@@ -1369,7 +1512,7 @@ function Show-Settings {
         }
       }
       '4' { Set-SioyekDb }
-      '5' { Clear-Screen; $Cfg.SIOYEK_ASKED = 0; Test-Dependencies; Write-Ok "rclone: $($Run.Rclone)"; if (Test-Sioyek) { Write-Ok 'sioyek installed' }; Wait-AnyKey }
+      '5' { Clear-Screen; $Cfg.SIOYEK_ASKED = 0; Test-Dependencies; Write-Ok "rclone: $($Run.Rclone)"; if (Test-Sioyek) { Write-Ok 'sioyek installed' }; if (Update-SqlitePath) { Write-Ok "sqlite3: $($Run.Sqlite)" }; Wait-AnyKey }
       '6' { Edit-Tuning }
       '7' {
         Clear-Screen
@@ -1431,7 +1574,7 @@ function Uninstall-Library {
       $target = (Join-Path (Join-Path $root $AnnotDir) 'shared.db').Replace('\', '/')
       $lines = @(Get-Content -LiteralPath $sp.Prefs -Encoding UTF8)
       $keep = @($lines | Where-Object { -not ($_ -match '^\s*shared_database_path\s+(.*)$' -and $Matches[1].Trim().Replace('\', '/') -eq $target) })
-      if ($keep.Count -ne $lines.Count) { Write-Atomic $sp.Prefs (($keep -join "`n") + "`n"); Write-Ok 'sioyek uses its own annotation database again.' }
+      if ($keep.Count -ne $lines.Count) { Write-SioyekPrefs $sp $keep; Write-Ok 'sioyek uses its own annotation database again.' }
     }
   }
   if ($onPath) {
@@ -1531,6 +1674,9 @@ Operations
            Renamed files get the new name on both sides (the side that renamed
            since the last sync wins).
   Renames/moves are done as moves (server-side on Drive), never as re-transfers.
+  sioyek's shared.db is merged row by row on Pull and Merge (needs sqlite3):
+           highlights/bookmarks added or deleted on either side since the last
+           sync are kept or deleted on both. Push uploads this device's copy.
 
 Only the selected folders are synced; logs\, .trash\ and the scripts stay local.
 The file-type filter is per device (e.g. PDFs only on a tablet); sioyek's
@@ -1617,6 +1763,7 @@ function Invoke-Main {
   [void](Read-Kv $StateFile)
   Update-Self
   Add-ScoopShimsToPath
+  [void](Update-SqlitePath)
   if (-not (Update-RclonePath)) { Test-Dependencies }
   Use-StableRcloneConfig
   Unlock-Rclone
