@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.4.0'
+$Version = '1.4.1'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'

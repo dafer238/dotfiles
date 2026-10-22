@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.4.0
+VERSION=1.4.1
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -398,7 +398,7 @@ compute_diff() {
     printf '%sListing %s and %s …%s\n' "$CD" "$(tildify "$LIBRARY_ROOT")" "$(rpath)" "$C0"
     start_listings "$TMP/ls.$RANDOM$RANDOM"
   else
-    ko_ready >/dev/null  # the prefetch imported quietly: still say why KOReader isn't synced, if it isn't
+    ko_ready >/dev/null && ko_archive_check  # the prefetch imported quietly: still warn here
   fi
   wait "${LIST_PIDS[@]}" 2>/dev/null
   d=$LIST_DIR LIST_DIR=
@@ -583,21 +583,40 @@ pager() {
 # termux-open hands a file to other apps through Termux's own content provider
 # (content://com.termux.files/<path>), which refuses to serve anything - the app just shows
 # "Unable to perform request" - unless allow-external-apps is true in termux.properties.
-# Asks once to turn it on (status view only: it draws on the bottom line). -> MSG on refusal.
-termux_share_ok() {
-  local f p=allow-external-apps
+TERMUX_SHARE_NOTE="It also lets apps you grant Termux's RUN_COMMAND permission run commands."
+termux_share_on() {
+  local f
   for f in "$HOME/.termux/termux.properties" "${XDG_CONFIG_HOME:-$HOME/.config}/termux/termux.properties"; do
-    grep -qE "^[[:space:]]*${p}[[:space:]]*[=:]?[[:space:]]*true[[:space:]]*$" "$f" 2>/dev/null && return 0
+    grep -qE "^[[:space:]]*allow-external-apps[[:space:]]*[=:]?[[:space:]]*true[[:space:]]*$" "$f" 2>/dev/null && return 0
   done
-  printf '\e[%d;1H\e[2K %sOther apps can only open Termux files with %s = true in ~/.termux/termux.properties' "$TH" "$CY" "$p"
-  printf ' (it also lets apps you grant Termux'"'"'s RUN_COMMAND permission run commands). Set it?%s %s[y/N]%s ' "$C0" "$CD" "$C0"
-  read_key
-  [[ $KEY == y || $KEY == Y ]] || { MSG="Not opened: Termux keeps files from other apps until $p = true is set."; return 1; }
-  f=$HOME/.termux/termux.properties
-  mkdir -p -- "${f%/*}" && { [[ ! -s $f || $(tail -c1 -- "$f") == '' ]] || echo; echo "$p = true"; } >>"$f" ||
+  return 1
+}
+
+termux_share_enable() {
+  local f=$HOME/.termux/termux.properties
+  mkdir -p -- "${f%/*}" && { [[ ! -s $f || $(tail -c1 -- "$f") == '' ]] || echo; echo "allow-external-apps = true"; } >>"$f" ||
     { MSG="Could not write $f"; return 1; }
   have termux-reload-settings && termux-reload-settings >/dev/null 2>&1
   return 0
+}
+
+# Status view only (asks on the bottom line) -> MSG on refusal.
+termux_share_ok() {
+  termux_share_on && return 0
+  printf '\e[%d;1H\e[2K %sOther apps can only open Termux files with allow-external-apps = true in ~/.termux/termux.properties.' "$TH" "$CY"
+  printf ' %s Set it?%s %s[y/N]%s ' "$TERMUX_SHARE_NOTE" "$C0" "$CD" "$C0"
+  read_key
+  [[ $KEY == y || $KEY == Y ]] || { MSG="Not opened: Termux keeps files from other apps until allow-external-apps = true is set."; return 1; }
+  termux_share_enable
+}
+
+# Setup screens: explain and offer it.
+termux_share_setup() {
+  termux_share_on && return 0
+  say " Reader apps can only open files from Termux (Status → s) once allow-external-apps = true is"
+  say " in ~/.termux/termux.properties. $TERMUX_SHARE_NOTE"
+  if yesno " Set it now?" y; then termux_share_enable && ok "Other apps can now open the files this tool hands them." || err "$MSG"
+  fi
 }
 
 # open_path PATH|URL: hand it to the desktop's default handler without blocking the menu.
@@ -1830,10 +1849,24 @@ ko_state_save() {
   done | write_atomic "$KO_STATE"
 }
 
+# KOReader's "Book metadata archive" can save a copy of every book's metadata as <partial md5>.lua
+# when it is closed. Pointed into the library, those copies get synced as extra files.
+ko_archive_check() {
+  local a; a=$(ko_lua get "$KOREADER_DIR/settings.reader.lua" document_metadata_arc_folder 2>/dev/null)
+  [[ -n $a ]] || return 0
+  a=$(readlink -f -- "$a" 2>/dev/null || printf '%s' "${a%/}")
+  [[ -n $a && ($a == "$LIBRARY_ROOT" || $a == "$LIBRARY_ROOT"/*) ]] || return 0
+  warn "KOReader's book metadata archive is $(tildify "$a"), so it saves a copy of every book you close there as"
+  say "  <hash>.lua and those get synced too (the sync already covers the metadata). In KOReader: ⚙ → Document →"
+  say "  Book metadata archive → Archive location: pick a folder outside the library (KOReader moves the copies"
+  say "  there), or turn off 'Save metadata to archive on book closing'."
+}
+
 # koreader_import [quiet]: copy what KOReader changed since the last look into the synced folder.
 koreader_import() {
   local quiet=${1:-} live stage sum rel l s mark held n=0 m=0
   ko_ready "$quiet" || return 0
+  [[ -n $quiet ]] || ko_archive_check
   live=$(ko_live) stage=$LIBRARY_ROOT/$KO_DIR
   [[ -d $live ]] || return 0
   ko_state_load
@@ -2100,6 +2133,7 @@ koreader_setup() {
     say "   file browser → ⚙ (settings) → Document → Book metadata location → …/koreader/hashdocsettings"
     say "   then 'Move book metadata' in the same menu moves the existing files there."
   fi
+  ko_archive_check
   ko_synced || { FOLDERS+=("$KO_DIR"); ok "Added '$KO_DIR' to synced folders."; }
   mkdir -p -- "$LIBRARY_ROOT/$KO_DIR"
   save_config; DIFF_READY=0
@@ -2147,7 +2181,9 @@ settings_menu() {
       4) sioyek_setup ;;
       k) koreader_setup ;;
       5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"
-         lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"; pause ;;
+         lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"
+         ((TERMUX)) && { termux_share_on && ok "Termux lets other apps open files (allow-external-apps)" || termux_share_setup; }
+         pause ;;
       6) tuning ;;
       7) cls
          f=$(rclone_minor)
@@ -2259,6 +2295,7 @@ first_run() {
       [[ -d $HOME/storage/shared ]] && LIBRARY_ROOT=$(termux_root)
     fi
   fi
+  ((TERMUX)) && { termux_share_setup; say; }
   say " Where should the library live on this device?"
   say " ${CD}(files, logs and this script are kept here; settings go to $(tildify "$CFG_DIR"))${C0}"
   ask " Library folder: " "$LIBRARY_ROOT"
