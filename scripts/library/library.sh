@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -1463,6 +1463,18 @@ main_menu() {
   done
 }
 
+# The 'library' command runs the copy installed in the library folder. When a different copy is
+# run (e.g. a newer download), offer to replace the installed one with it.
+self_update() {
+  local inst=$LIBRARY_ROOT/library.sh v
+  [[ -f $inst && $SELF != "$inst" && -t 0 && $TTY == 1 ]] || return 0
+  cmp -s -- "$SELF" "$inst" && return 0
+  v=$(sed -n 's/^VERSION=//p' "$inst" | head -n1)
+  info "The installed copy ($(tildify "$inst"), v${v:-?}) differs from this one (v$VERSION)."
+  yesno " Replace the installed copy with this one?" y || return 0
+  cp -- "$SELF" "$inst" && { chmod 700 -- "$inst" 2>/dev/null; :; } && ok "Updated - 'library' now runs v$VERSION."
+}
+
 usage() { sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
@@ -1489,6 +1501,7 @@ main() {
     [[ $cmd == setup ]] && cmd=menu
   fi
   load_kv "$STATE_FILE"
+  self_update
   have rclone || check_deps
   unlock_rclone
   case $cmd in

@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.0.0'
+$Version = '1.1.0'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'
@@ -1463,6 +1463,18 @@ function Install-Self {
   }
 }
 
+# The 'library' command runs the copy installed in the library folder. When a different copy is
+# run (e.g. a newer download), offer to replace the installed one with it.
+function Update-Self {
+  $inst = Join-Path $Cfg.LIBRARY_ROOT 'library.ps1'
+  if (-not $Run.Interactive -or -not (Test-Path -LiteralPath $inst) -or $Self -ieq $inst) { return }
+  if ((Get-FileHash -LiteralPath $Self).Hash -eq (Get-FileHash -LiteralPath $inst).Hash) { return }
+  $v = (Select-String -LiteralPath $inst -Pattern "^\`$Version = '([^']*)'" | Select-Object -First 1)
+  $v = if ($v) { $v.Matches[0].Groups[1].Value } else { '?' }
+  Write-Info "The installed copy ($(Get-Tilde $inst), v$v) differs from this one (v$Version)."
+  if (Read-YesNo ' Replace the installed copy with this one?' 'y') { Install-Self }
+}
+
 function Start-FirstRun {
   Clear-Screen
   Say; Say " ${CB}library$C0 - Google Drive sync for books, papers and sioyek annotations"; Say
@@ -1603,6 +1615,7 @@ function Invoke-Main {
     $Command = 'menu'
   }
   [void](Read-Kv $StateFile)
+  Update-Self
   Add-ScoopShimsToPath
   if (-not (Update-RclonePath)) { Test-Dependencies }
   Use-StableRcloneConfig
