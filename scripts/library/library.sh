@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.1.0
+VERSION=1.1.2
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -69,7 +69,7 @@ fi
 
 CAT_KEYS=(changes radd rnew ladd lnew ren size same)
 declare -A CAT_LABEL=([changes]="All changes" [radd]="New on remote" [rnew]="Newer on remote"
-  [ladd]="New locally" [lnew]="Newer locally" [size]="Conflicts" [same]="In sync")
+  [ladd]="New locally" [lnew]="Newer locally" [ren]="Renamed" [size]="Conflicts" [same]="In sync")
 declare -A CAT_SYM=([radd]="↓+" [rnew]="↓~" [ladd]="↑+" [lnew]="↑~" [ren]=" »" [size]="!≠" [same]=" =")
 declare -A CAT_COL=([radd]=$CG [rnew]=$CC [ladd]=$CY [lnew]=$CM [ren]=$CBL [size]=$CR [same]=$CD)
 
@@ -219,6 +219,7 @@ load_kv() {
     [[ -z $k || $k == \#* ]] && continue
     apply_kv "$k" "$v"
   done <"$1"
+  return 0  # the file exists; don't leak the status of the last apply_kv (e.g. SIOYEK_ASKED=0)
 }
 
 write_atomic() { # FILE  (content on stdin)
