@@ -15,6 +15,7 @@ eval "$(starship init zsh)"
 
 # Add cargo to path
 export PATH="$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 # Automatically attach to an unattached session, or create a new one
 if [[ -z "$TMUX" ]] && [[ -t 0 ]] && [[ -t 1 ]]; then
