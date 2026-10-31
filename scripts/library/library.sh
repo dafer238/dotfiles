@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=1.4.1
+VERSION=1.5.0
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 CFG_DIR=${LIBRARY_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/library-sync}
 CFG_FILE=$CFG_DIR/config
@@ -56,6 +56,7 @@ BWLIMIT=
 SIOYEK_ASKED=0
 KOREADER_DIR=
 KO_CONFLICT=newer
+BRIDGE=1
 KO_POLICY=newer KO_ALL=
 LAST_PULL= LAST_PUSH= LAST_MERGE=
 DIFF_READY=0
@@ -213,6 +214,7 @@ apply_kv() {
     SIOYEK_ASKED) [[ $v == 1 ]] && SIOYEK_ASKED=1 ;;
     KOREADER_DIR) [[ -z $v || $v == /* ]] && KOREADER_DIR=$v ;;
     KO_CONFLICT) [[ $v =~ ^(newer|local|remote|ask)$ ]] && KO_CONFLICT=$v ;;
+    BRIDGE) [[ $v =~ ^[01]$ ]] && BRIDGE=$v ;;
     LAST_PULL | LAST_PUSH | LAST_MERGE) [[ $v =~ ^[0-9T:+.-]*$ ]] && printf -v "$k" '%s' "$v" ;;
   esac
 }
@@ -254,6 +256,7 @@ BWLIMIT=$BWLIMIT
 SIOYEK_ASKED=$SIOYEK_ASKED
 KOREADER_DIR=$KOREADER_DIR
 KO_CONFLICT=$KO_CONFLICT
+BRIDGE=$BRIDGE
 EOF
 }
 
@@ -827,6 +830,13 @@ run_rclone() { # LOGFILE ARGS...
 # do_sync pull|push|merge [assume_yes] [force]
 do_sync() {
   local op=$1 yes=${2:-0} force=${3:-0} a b c d over del dest_n ts log rc=0 title ren unk revert names=b merge_db=0 ko_n=0 ko_new=0
+  local bridged
+  # Translate what this device has between sioyek and KOReader, so it goes up with this sync
+  # (KOReader's latest changes first: the listing would only copy them in afterwards).
+  koreader_import
+  annot_bridge local || warn "$BRIDGE_MSG"
+  bridged=$BRIDGE_MSG
+  ((BRIDGE_CHANGED)) && DIFF_READY=0
   [[ $DIFF_READY == 1 ]] || compute_diff || return 1
   [[ $op != push ]] && annot_db_changed && merge_db=1
   [[ $op != push ]] && read -r ko_n ko_new < <(ko_pending "$op")
@@ -873,6 +883,7 @@ do_sync() {
     ((ko_n)) && printf '   %s⇄ %5d%s  KOReader books changed here are merged with the remote copy; conflicts: %s%s%s  %s(c to change)%s\n' \
       "$CBL" "$ko_n" "$C0" "$CB" "$(ko_policy_desc "$KO_POLICY")" "$C0" "$CD" "$C0"
     ((ko_new)) && printf '   %s↑ %5d%s  KOReader books first opened here are uploaded, not removed\n' "$CY" "$ko_new" "$C0"
+    [[ -n $bridged ]] && printf '   %s⇄      %s  %s\n' "$CBL" "$C0" "$bridged"
     if ((a + b + over + del + ren + ko_new == 0)); then
       ok "Already in sync - nothing to $op."
       set_last "$op"
@@ -943,10 +954,16 @@ do_sync() {
   esac
   DIFF_READY=0
   say
+  # What just arrived, translated for the other reader and uploaded at once. If that fails, the
+  # merge bases stay as they were, so the next sync merges instead of overwriting the translation.
+  if ((rc == 0)) && [[ $op != push ]] && ! annot_bridge upload "$LIBRARY_ROOT/.trash/$ts" "$REMOTE:$REMOTE_TRASH/$ts"; then
+    err "$BRIDGE_MSG"; rc=1
+  fi
   if ((rc == 0)); then
     set_last "$op"
     log_line "$op ok"
     ok "${op^} finished. Log: $(tildify "$log")"
+    [[ -n $BRIDGE_MSG && $BRIDGE_MSG != "$bridged" ]] && info "$BRIDGE_MSG"
   else
     log_line "$op FAILED rc=$rc"
     err "${op^} failed (rclone exit $rc). Last errors from $(tildify "$log"):"
@@ -1383,8 +1400,8 @@ sioyek_merge() {
   local rel=$ANNOT_DIR/shared.db ldb=$LIBRARY_ROOT/$ANNOT_DIR/shared.db base b schema gen
   local remote=$TMP/remote-shared.db merged=$TMP/merged-shared.db
   base=$(sioyek_base) b=$TMP/base-shared.db
-  # sioyek doesn't run on Android, so its copy never has changes of its own.
-  ((TERMUX)) && return 0
+  # sioyek doesn't run on Android: its copy only changes there when KOReader's annotations go into it.
+  ((TERMUX)) && ! bridge_on && return 0
   [[ -f $ldb ]] || return 0
   # Unchanged here since the last sync: the remote copy already holds everything.
   [[ -f $base ]] && cmp -s -- "$ldb" "$base" && return 0
@@ -1482,9 +1499,15 @@ read -r -d '' KO_LUA <<'EOF'
 --                               POLICY newer|local|remote|ask. With ask and no ANSWERS the conflicts are
 --                               printed (id TAB what TAB here TAB remote) and the exit status is 3.
 --   get IN KEY                  print a top-level value (reads settings.reader.lua)
+--   bridge JOBS ROWS SQL HCOLS BCOLS
+--                               translate between sioyek's database and KOReader's PDF metadata (see
+--                               "sioyek <-> KOReader" below); writes each changed file as PATH.bridge.tmp,
+--                               prints "file PATH" for it and a "stats" line, and the SQL for sioyek to SQL
 -- Files are written the way KOReader's dump() writes them, so unchanged data gives identical bytes.
 
 local MARK, FLAG = "library_sync", "annotations_externally_modified"
+-- Ids of every annotation ever linked to sioyek (bridge below): only ever grows, merged as a union.
+local LINKS = "sioyek_bridged"
 -- Reading progress and book status follow the reader from device to device; every other key
 -- (fonts, margins, zoom, page counts, statistics) stays as each device has it.
 local SYNCED = { last_xpointer = true, last_epubcfi = true, last_page = true, page_positions = true,
@@ -1692,6 +1715,11 @@ local function merge(L, R, B, ltime, rtime, policy, answers, conflicts)
         else
           local c = decide("a:" .. k, where(l), describe_ann(l), describe_ann(r), stamp_of(l) >= stamp_of(r))
           keep = c == "b" and both(l, r) or c == "r" and r or l
+          -- Whichever version wins, it stays linked to its sioyek counterpart.
+          local other = keep == l and r or l
+          if keep.sioyek_uuid == nil and other.sioyek_uuid ~= nil then
+            keep = copy(keep); keep.sioyek_uuid, keep.sioyek_type = other.sioyek_uuid, other.sioyek_type
+          end
         end
       elseif b and eq(l, b, DERIVED) then
         keep = nil -- deleted on the remote; kept when it was also edited here
@@ -1724,6 +1752,13 @@ local function merge(L, R, B, ltime, rtime, policy, answers, conflicts)
     for k in pairs(pending) do out[k] = (c == "r" and R or L)[k] end
   end
 
+  if L[LINKS] ~= nil or R[LINKS] ~= nil then
+    out[LINKS] = {}
+    for _, t in ipairs({ L, R }) do
+      for k, v in pairs(type(t[LINKS]) == "table" and t[LINKS] or {}) do out[LINKS][k] = v end
+    end
+  end
+
   -- Everything else is this device's; the remote fills in only what this device lacks.
   for _, t in ipairs({ L, R }) do
     for k, v in pairs(t) do
@@ -1731,6 +1766,334 @@ local function merge(L, R, B, ltime, rtime, policy, answers, conflicts)
     end
   end
   return out
+end
+
+-- ------------------------------------------------------- sioyek <-> KOReader --
+-- PDFs only. sioyek keeps highlights and bookmarks in its database, keyed by the full MD5 of the
+-- file, at "absolute" positions: pages stacked with no gap, y from the top of page 1, x from the
+-- middle of the page. KOReader keeps them per book (partial MD5) at positions on a page, x and y
+-- from the page's top-left corner. Both measure in MuPDF's page units, so the page sizes are all
+-- a translation needs. Each translated pair shares one id: the sioyek row's uuid (or, in databases
+-- without that column, one made from its position), stored on the KOReader item as sioyek_uuid.
+-- The book's LINKS list remembers every id ever linked, which tells a deletion on one side from
+-- an annotation the other side has not seen yet. Edits go to the newer side.
+
+-- Default highlight letter ("ha") <-> default KOReader color (yellow, gray on e-ink); otherwise
+-- the nearest color of sioyek's default palette and KOReader's.
+local TO_KO = { a = "yellow", b = "blue", c = "orange", d = "purple", e = "gray", f = "green", g = "green",
+  h = "yellow", i = "gray", j = "olive", k = "olive", l = "olive", m = "purple", n = "blue", o = "orange",
+  p = "red", q = "green", r = "red", s = "cyan", t = "cyan", u = "yellow", v = "purple", w = "red",
+  x = "yellow", y = "yellow", z = "red" }
+local TO_SIO = { yellow = "a", gray = "a", red = "r", orange = "o", green = "g", olive = "j", cyan = "s",
+  blue = "b", purple = "v" }
+
+-- sioyek: lowercase letters fill, uppercase underline, "_" strikes through.
+local function ko_style(t)
+  t = tostring(t or "a")
+  if t == "_" then return "strikeout", "red" end
+  local l = t:lower()
+  return t ~= l and "underscore" or "lighten", TO_KO[l] or "yellow"
+end
+
+local function sio_type(k)
+  if k.drawer == "strikeout" then return "_" end
+  local l = TO_SIO[k.color or "yellow"] or "a"
+  return k.drawer == "underscore" and l:upper() or l
+end
+
+-- Does KOReader item k look the way sioyek type t is shown? (Two letters can share a color, so
+-- the letter an item was made from is kept on it as sioyek_type.)
+local function type_matches(k, t)
+  if sio_type(k) == t then return true end
+  local d, c = ko_style(t)
+  return k.sioyek_type == t and (k.drawer or "lighten") == d and (k.color or "yellow") == c
+end
+
+-- sioyek stores UTC (CURRENT_TIMESTAMP), KOReader local time.
+local function parse_time(s)
+  local y, mo, d, h, mi, se = tostring(s or ""):match("^(%d+)-(%d+)-(%d+)[ T](%d+):(%d+):(%d+)")
+  if y then return { year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+    hour = tonumber(h), min = tonumber(mi), sec = tonumber(se) } end
+end
+
+local function utc_to_local(s)
+  local t = parse_time(s)
+  if not t then return nil end
+  local y, m = t.year, t.month -- days since 1970-01-01 (H. Hinnant's days_from_civil)
+  if m <= 2 then y = y - 1 end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * (m + (m > 2 and -3 or 9)) + 2) / 5) + t.day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  local days = era * 146097 + doe - 719468
+  return os.date("%Y-%m-%d %H:%M:%S", days * 86400 + t.hour * 3600 + t.min * 60 + t.sec)
+end
+
+local function local_to_utc(s)
+  local t = parse_time(s)
+  if not t then return "" end
+  return os.date("!%Y-%m-%d %H:%M:%S", os.time(t))
+end
+
+local function unhex(h) return (h:gsub("%x%x", function(c) return string.char(tonumber(c, 16)) end)) end
+
+local function split(line)
+  local t = {}
+  for f in (line .. "\t"):gmatch("([^\t]*)\t") do t[#t + 1] = f end
+  return t
+end
+
+local function load_pages(path)
+  local P, acc = {}, 0
+  for line in io.lines(path) do
+    local w, h = line:match("^%s*([%d.]+)%s+([%d.]+)")
+    if w then P[#P + 1] = { w = tonumber(w), h = tonumber(h), acc = acc }; acc = acc + tonumber(h) end
+  end
+  return P
+end
+
+local function to_page(P, x, y)
+  local lo, hi = 1, #P
+  while lo < hi do -- last page starting at or above y
+    local mid = math.floor((lo + hi + 1) / 2)
+    if P[mid].acc <= y then lo = mid else hi = mid - 1 end
+  end
+  local p = P[lo]
+  return { page = lo, x = x + p.w / 2, y = y - p.acc, zoom = 1, rotation = 0 }
+end
+
+local function to_abs(P, pos)
+  local p = type(pos) == "table" and P[pos.page]
+  if not p then return nil end
+  return (pos.x or 0) - p.w / 2, (pos.y or 0) + p.acc
+end
+
+local function before(a, b)
+  if a.page ~= b.page then return a.page < b.page end
+  if math.abs(a.y - b.y) > 0.5 then return a.y < b.y end
+  return a.x <= b.x
+end
+
+local function near(p, q)
+  return type(p) == "table" and p.page == q.page and math.abs((p.x or 0) - q.x) < 0.5 and math.abs((p.y or 0) - q.y) < 0.5
+end
+
+-- Where sioyek row s sits in KOReader's terms: highlight start/end, or the bookmark's page.
+local function place(P, s)
+  if s.kind == "b" then return to_page(P, 0, s.by ~= -1 and s.by or s.oy).page end
+  local a, b = to_page(P, s.bx, s.by), to_page(P, s.ex, s.ey)
+  if before(b, a) then a, b = b, a end
+  return a, b
+end
+
+local function fill_ko(P, k, s)
+  if s.kind == "b" then
+    k.page = place(P, s)
+    k.pageno = k.page
+  else
+    local a, b = place(P, s)
+    k.pos0, k.pos1, k.page, k.pageno, k.ext, k.pboxes = a, b, a.page, a.page, nil, nil
+    if a.page ~= b.page then -- multi-page: KOReader wants each page's part, as it builds them itself
+      k.ext = {}
+      for p = a.page, b.page do
+        k.ext[p] = { pos0 = p == a.page and { x = a.x, y = a.y } or { x = 0, y = 0 },
+          pos1 = p == b.page and { x = b.x, y = b.y } or { x = P[p].w, y = P[p].h } }
+      end
+    end
+    k.text = s.desc ~= "" and s.desc or nil
+    k.drawer, k.color = ko_style(s.type)
+    k.sioyek_type = s.type
+  end
+  local note = s.kind == "b" and s.desc or s.annot -- a sioyek bookmark's text is the KOReader note
+  k.note = note ~= "" and note or nil
+  k.datetime = k.datetime or utc_to_local(s.ctime) or os.date("%Y-%m-%d %H:%M:%S")
+  k.datetime_updated = s.mtime ~= "" and s.mtime ~= s.ctime and utc_to_local(s.mtime) or k.datetime_updated
+end
+
+local function same(P, s, k, cols)
+  if s.kind == "b" then return (k.note or "") == s.desc and k.page == place(P, s) end
+  if cols.text_annot and (k.note or "") ~= s.annot then return false end
+  local a, b = place(P, s)
+  return (k.text or "") == s.desc and type_matches(k, s.type)
+    and ((near(k.pos0, a) and near(k.pos1, b)) or (near(k.pos0, b) and near(k.pos1, a)))
+end
+
+-- The sioyek row KOReader item k stands for (k.pos0/pos1 may be in either order).
+local function from_ko(P, k)
+  local s = { kind = k.drawer and "h" or "b", annot = "", desc = "",
+    ctime = local_to_utc(k.datetime), mtime = local_to_utc(k.datetime_updated or k.datetime) }
+  if s.kind == "b" then
+    s.desc = k.note or ""
+    s.oy = select(2, to_abs(P, { page = k.page, x = 0, y = 0 }))
+    s.bx, s.by, s.ex, s.ey = -1, -1, -1, -1
+  else
+    s.desc, s.annot = k.text or "", k.note or ""
+    s.type = k.sioyek_type and type_matches(k, k.sioyek_type) and k.sioyek_type or sio_type(k)
+    s.bx, s.by = to_abs(P, k.pos0)
+    s.ex, s.ey = to_abs(P, k.pos1)
+    if not (s.bx and s.ex) then return nil end
+    s.oy = -1
+  end
+  return s
+end
+
+-- Id of a row in a database without the uuid column (sioyek 2.0): its position.
+local function pos_key(s)
+  if s.kind == "b" then return string.format("sioyek-b-%.1f", s.by ~= -1 and s.by or s.oy) end
+  return string.format("sioyek-%s-%.1f-%.1f-%.1f-%.1f", s.type, s.bx, s.by, s.ex, s.ey)
+end
+
+-- Id for a KOReader annotation that is new to sioyek: the same on every device that bridges it.
+local function ko_key(k)
+  local p = type(k.pos0) == "table" and k.pos0 or {}
+  return string.format("koreader-%s-%s%d-%d-%d", (tostring(k.datetime or ""):gsub("%D", "")),
+    k.drawer and "h" or "b", tonumber(k.page) or 0, math.floor((p.x or 0) + 0.5), math.floor((p.y or 0) + 0.5))
+end
+
+local function sql_text(v) -- hex literal: no quoting can break, and CAST keeps it TEXT
+  return string.format("CAST(X'%s' AS TEXT)", (tostring(v or ""):gsub(".", function(c) return string.format("%02X", c:byte()) end)))
+end
+local function sql_num(v) return string.format("%.9g", v) end
+
+local function sql_values(s, cols, H, key)
+  local names, vals = { "document_path", "desc" }, { sql_text(H), sql_text(s.desc) }
+  local function add(c, v) if cols[c] then names[#names + 1] = c; vals[#vals + 1] = v end end
+  if s.kind == "h" then
+    add("type", sql_text(s.type))
+    add("begin_x", sql_num(s.bx)); add("begin_y", sql_num(s.by)); add("end_x", sql_num(s.ex)); add("end_y", sql_num(s.ey))
+    add("text_annot", sql_text(s.annot))
+  else
+    add("offset_y", sql_num(s.oy))
+  end
+  if s.ctime ~= "" then add("creation_time", sql_text(s.ctime)) end
+  if s.mtime ~= "" then add("modification_time", sql_text(s.mtime)) end
+  if key then add("uuid", sql_text(key)) end
+  return names, vals
+end
+
+local function bridge(jobs_path, rows_path, sql_path, hcols, bcols)
+  local cols = { h = {}, b = {} }
+  for c in hcols:gmatch("[^,]+") do cols.h[c] = true end
+  for c in bcols:gmatch("[^,]+") do cols.b[c] = true end
+  local rows = {} -- full MD5 -> sioyek rows, oldest first
+  for line in io.lines(rows_path) do
+    local f = split(line)
+    if #f >= 14 then
+      local s = { kind = f[1], uuid = f[3], desc = unhex(f[4]), annot = unhex(f[5]), type = f[6] ~= "" and f[6] or "a",
+        bx = tonumber(f[7]) or -1, by = tonumber(f[8]) or -1, ex = tonumber(f[9]) or -1, ey = tonumber(f[10]) or -1,
+        oy = tonumber(f[11]) or -1, ctime = f[12], mtime = f[13], id = tonumber(f[14]) }
+      rows[f[2]] = rows[f[2]] or {}
+      table.insert(rows[f[2]], s)
+    end
+  end
+  local sql, books, stats = {}, {}, { ko_new = 0, ko_upd = 0, ko_del = 0, sio_new = 0, sio_upd = 0, sio_del = 0 }
+  local deletions, linked = {}, 0
+  for line in io.lines(jobs_path) do
+    local H, Pmd5, path, header, pages = line:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)$")
+    local P = H and load_pages(pages)
+    local T = P and #P > 0 and read_table(path)
+    if P and #P > 0 and not T then
+      local f = io.open(path, "rb")
+      if f then f:close() else T = { partial_md5_checksum = Pmd5 } end -- unreadable: leave it alone
+    end
+    local paging = T and true
+    for _, k in ipairs(T and type(T.annotations) == "table" and T.annotations or {}) do
+      if type(k) ~= "table" or type(k.page) ~= "number" then paging = false end -- a reflowable book
+    end
+    if paging then
+      local book = { T = T, path = path, header = header, changed = false }
+      books[#books + 1] = book
+      T.annotations = type(T.annotations) == "table" and T.annotations or {}
+      T[LINKS] = type(T[LINKS]) == "table" and T[LINKS] or {}
+      local links, K, seen = T[LINKS], {}, {}
+      for _, k in ipairs(T.annotations) do
+        if k.sioyek_uuid then K[k.sioyek_uuid] = k; linked = linked + 1 end
+      end
+      local function emit(s, key) -- new sioyek row for KOReader item
+        local c = cols[s.kind]
+        local names, vals = sql_values(s, c, H, c.uuid and key)
+        sql[#sql + 1] = string.format("INSERT INTO %s (%s) VALUES (%s);", s.kind == "h" and "highlights" or "bookmarks",
+          table.concat(names, ", "), table.concat(vals, ", "))
+      end
+      for _, s in ipairs(rows[H] or {}) do
+        local tbl = s.kind == "h" and "highlights" or "bookmarks"
+        local key = s.uuid ~= "" and s.uuid or pos_key(s)
+        local k = K[key]
+        if seen[key] then -- the same row twice (merged from two devices): keep one
+          sql[#sql + 1] = string.format("DELETE FROM %s WHERE id = %d;", tbl, s.id)
+        elseif k then
+          seen[key] = true
+          if not same(P, s, k, cols[s.kind]) then
+            if s.mtime > local_to_utc(k.datetime_updated or k.datetime) then -- sioyek's is newer
+              fill_ko(P, k, s); book.changed = true; stats.ko_upd = stats.ko_upd + 1
+            else
+              local n = from_ko(P, k)
+              if n then
+                local names, vals = sql_values(n, cols[s.kind], H)
+                local sets = {}
+                for i, c in ipairs(names) do
+                  if c ~= "document_path" and c ~= "creation_time" then sets[#sets + 1] = c .. " = " .. vals[i] end
+                end
+                sql[#sql + 1] = string.format("UPDATE %s SET %s WHERE id = %d;", tbl, table.concat(sets, ", "), s.id)
+                if not cols[s.kind].uuid then -- the id is the position: follow it
+                  local nk = pos_key(n)
+                  if nk ~= key then k.sioyek_uuid, links[nk] = nk, true; book.changed = true end
+                end
+                stats.sio_upd = stats.sio_upd + 1
+              end
+            end
+          end
+        elseif links[key] then -- linked before, gone from KOReader: deleted there
+          seen[key] = true
+          deletions[#deletions + 1] = { sql = string.format("DELETE FROM %s WHERE id = %d;", tbl, s.id), stat = "sio_del" }
+        else -- new in sioyek
+          seen[key] = true
+          k = { sioyek_uuid = key }
+          fill_ko(P, k, s)
+          table.insert(T.annotations, k)
+          links[key] = true; book.changed = true; stats.ko_new = stats.ko_new + 1
+        end
+      end
+      for _, k in ipairs(T.annotations) do
+        local u = k.sioyek_uuid
+        if not (u and seen[u]) and (k.drawer == nil or type(k.pos0) == "table") then
+          if u and links[u] then -- linked before, gone from sioyek: deleted there
+            deletions[#deletions + 1] = { book = book, item = k, stat = "ko_del" }
+          else -- new in KOReader (or linked but never recorded: same thing)
+            local s = from_ko(P, k)
+            if s then
+              -- Without a uuid column the row is found by its position, so that is the id.
+              local key = cols[s.kind].uuid and (u or ko_key(k)) or pos_key(s)
+              emit(s, key)
+              k.sioyek_uuid, k.sioyek_type = key, s.kind == "h" and s.type or nil
+              links[key] = true; book.changed = true; stats.sio_new = stats.sio_new + 1
+            end
+          end
+        end
+      end
+    end
+  end
+  -- A database replaced by an empty or old one must not wipe KOReader (or the other way round).
+  local held = 0
+  if #deletions > 5 and #deletions * 2 > linked then held = #deletions; deletions = {} end
+  for _, d in ipairs(deletions) do
+    if d.sql then sql[#sql + 1] = d.sql
+    else
+      for i, k in ipairs(d.book.T.annotations) do
+        if k == d.item then table.remove(d.book.T.annotations, i); break end
+      end
+      d.book.changed = true
+    end
+    stats[d.stat] = stats[d.stat] + 1
+  end
+  for _, b in ipairs(books) do
+    -- Written beside the file: library.sh puts it in place once sioyek's database took its part.
+    if b.changed then write_table(b.path .. ".bridge.tmp", b.header, b.T); print("file " .. b.path) end
+  end
+  local f = io.open(sql_path, "wb") or fail("cannot write " .. sql_path)
+  f:write(table.concat(sql, "\n"), #sql > 0 and "\n" or ""); f:close()
+  print(string.format("stats %d %d %d %d %d %d %d", stats.ko_new, stats.ko_upd, stats.ko_del,
+    stats.sio_new, stats.sio_upd, stats.sio_del, held))
 end
 
 -- --------------------------------------------------------------------- main --
@@ -1746,7 +2109,7 @@ elseif mode == "stamp" then
   -- The synced copy carries the layout of whichever device synced it last; keep this device's.
   local own = read_table(arg[3])
   for k, v in pairs(own or {}) do
-    if k ~= "annotations" and not SYNCED[k] and k ~= MARK and k ~= FLAG then t[k] = v end
+    if k ~= "annotations" and not SYNCED[k] and k ~= MARK and k ~= FLAG and k ~= LINKS then t[k] = v end
   end
   t[MARK] = arg[5]
   -- Makes KOReader recompute page numbers and re-sort the annotations when it opens the book.
@@ -1774,11 +2137,13 @@ elseif mode == "merge" then
     os.exit(3)
   end
   write_table(out_path, header, out)
+elseif mode == "bridge" then
+  bridge(arg[2], arg[3], arg[4], arg[5] or "", arg[6] or "")
 elseif mode == "get" then
   local v = load_table(arg[2])[arg[3]]
   if type(v) == "string" or type(v) == "number" or type(v) == "boolean" then print(tostring(v)) end
 else
-  fail("usage: komerge.lua canon|stamp|merge|get ...")
+  fail("usage: komerge.lua canon|stamp|merge|bridge|get ...")
 end
 EOF
 
@@ -2150,6 +2515,235 @@ koreader_setup() {
   pause
 }
 
+# --------------------------------------------------- sioyek <-> koreader --
+# Translates highlights and bookmarks between sioyek's database and KOReader's metadata files
+# (PDFs only; the "bridge" mode of the Lua program above). It runs on any device that syncs both
+# folders and has sqlite3, Lua and mutool: before every sync, so what this device has is
+# translated and goes up with it, and after a Pull or Merge, so what just arrived shows up in the
+# other reader now (the result is uploaded straight away). Books are matched by content: sioyek
+# names a PDF by its MD5, KOReader by a partial MD5; pdf-index caches both for every PDF here.
+PDF_INDEX=$CFG_DIR/pdf-index
+BRIDGE_MSG= BRIDGE_CHANGED=0
+
+bridge_on() { [[ $BRIDGE == 1 ]] && ko_synced && [[ " ${FOLDERS[*]} " == *" $ANNOT_DIR "* ]]; }
+
+bridge_missing() {
+  local -a m=()
+  have sqlite3 || m+=(sqlite3)
+  lua_bin >/dev/null || m+=(lua)
+  have mutool || m+=(mutool)
+  printf '%s' "${m[*]}"
+}
+
+install_mutool() {
+  case $(pkg_manager) in
+    termux) confirm_run pkg install -y mupdf-tools ;;
+    pacman) confirm_run as_root pacman -S --needed mupdf-tools ;;
+    apt) confirm_run as_root apt-get install -y mupdf-tools ;;
+    dnf) confirm_run as_root dnf install -y mupdf ;;
+    zypper) confirm_run as_root zypper install -y mupdf ;;
+    *) err "Install mutool (MuPDF's command-line tools) with your package manager."; return 1 ;;
+  esac
+}
+
+# KOReader's util.partialMD5: 1 KiB at offset 0, then at 1 KiB << 2i for i = 0..10, until the end.
+# (Its offset for i = -1 is LuaJIT's bit.lshift(1024, -2), which is 0, not 256.)
+partial_md5() {
+  local f=$1 size i off
+  size=$(stat -c %s -- "$f" 2>/dev/null) || return 1
+  for ((i = -1; i <= 10; i++)); do
+    off=$((i < 0 ? 0 : 1024 << (2 * i)))
+    ((off < size)) || break
+    dd if="$f" bs=1024 count=1 skip="$off" iflag=skip_bytes status=none
+  done | md5sum | cut -d' ' -f1
+}
+
+# pdf_index: "path TAB size TAB time TAB md5 TAB partial md5" for every PDF in the library.
+pdf_index() {
+  local rel size mt md5 pmd5 n=0 todo
+  local -A old=()
+  if [[ -f $PDF_INDEX ]]; then
+    while IFS=$'\t' read -r rel size mt md5 pmd5; do old[$rel]="$size $mt $md5 $pmd5"; done <"$PDF_INDEX"
+  fi
+  (cd -- "$LIBRARY_ROOT" && find . \( -path ./.trash -o -path ./logs \) -prune -o -type f -iname '*.pdf' -printf '%P\t%s\t%T@\n') >"$TMP/pdfs"
+  todo=$(while IFS=$'\t' read -r rel size mt; do [[ ${old[$rel]-} == "$size $mt "* ]] || echo; done <"$TMP/pdfs" | wc -l)
+  ((todo > 20)) && info "Indexing $todo PDFs for sioyek ↔ KOReader (once; later only new or changed ones)…"
+  while IFS=$'\t' read -r rel size mt; do
+    if [[ ${old[$rel]-} == "$size $mt "* ]]; then
+      read -r _ _ md5 pmd5 <<<"${old[$rel]}"
+    else
+      md5=$(md5sum -- "$LIBRARY_ROOT/$rel" | cut -d' ' -f1) && pmd5=$(partial_md5 "$LIBRARY_ROOT/$rel") || continue
+      ((++n))
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$size" "$mt" "$md5" "$pmd5"
+  done <"$TMP/pdfs" | write_atomic "$PDF_INDEX"
+}
+
+# pdf_pages FILE MD5 -> path of a "width height" line per page, in MuPDF's page units (cached).
+pdf_pages() {
+  local out=$CFG_DIR/pages/$2
+  if [[ ! -s $out ]]; then
+    mkdir -p -- "${out%/*}" || return 1
+    # MuPDF's own page bounds (crop box, rotation), exactly what sioyek and KOReader lay out.
+    printf '%s\n' 'var d = Document.openDocument(scriptArgs[0]);' \
+      'for (var i = 0; i < d.countPages(); i++) { var p = d.loadPage(i), b = p.getBounds ? p.getBounds() : p.bound(); print((b[2] - b[0]) + " " + (b[3] - b[1])); }' \
+      >"$TMP/bounds.js"
+    if ! mutool run "$TMP/bounds.js" "$1" >"$out.tmp" 2>/dev/null || [[ ! -s $out.tmp ]]; then
+      # mutool without JavaScript: work the bounds out from the page boxes.
+      mutool pages "$1" 2>/dev/null | awk '
+        function box(s,  a) { split(s, a, "\""); l = a[2]; b = a[4]; r = a[6]; t = a[8] }
+        /<page /     { m = ""; c = ""; rot = 0 }
+        /<MediaBox / { box($0); ml = l; mb = b; mr = r; mt = t; m = 1 }
+        /<CropBox /  { box($0); cl = l; cb = b; cr = r; ct = t; c = 1 }
+        /<Rotate /   { split($0, a, "\""); rot = a[2] % 360 }
+        /<\/page>/   { if (!c) { cl = ml; cb = mb; cr = mr; ct = mt }
+                       w = (cr < mr ? cr : mr) - (cl > ml ? cl : ml); h = (ct < mt ? ct : mt) - (cb > mb ? cb : mb)
+                       if (rot == 90 || rot == 270) { x = w; w = h; h = x }
+                       print w, h }' >"$out.tmp"
+    fi
+    [[ -s $out.tmp ]] && mv -f -- "$out.tmp" "$out" || { rm -f -- "$out.tmp"; return 1; }
+  fi
+  printf '%s' "$out"
+}
+
+# annot_bridge local|upload [LOCAL_TRASH REMOTE_TRASH]: translate both ways; with upload, send
+# what changed to the remote at once. Sets BRIDGE_MSG and BRIDGE_CHANGED; returns 1 only on failure.
+annot_bridge() {
+  local mode=$1 db=$LIBRARY_ROOT/$ANNOT_DIR/shared.db stage=$LIBRARY_ROOT/$KO_DIR ts lt rt
+  local hc bc miss rel size mt md5 pmd5 f ext side pages line
+  local -A rowdocs=() sidecars=() done_md5=()
+  local -a changed=() st
+  BRIDGE_MSG= BRIDGE_CHANGED=0
+  bridge_on && [[ -f $db ]] || return 0
+  miss=$(bridge_missing)
+  if [[ -n $miss ]]; then
+    BRIDGE_MSG="sioyek ↔ KOReader translation needs: $miss (Settings → sioyek ↔ KOReader installs it)"
+    return 0
+  fi
+  ts=$(date +%Y-%m-%d_%H%M%S)
+  lt=${2:-$LIBRARY_ROOT/.trash/$ts} rt=${3:-$REMOTE:$REMOTE_TRASH/$ts}
+  hc=$(sqlite3 -batch "$db" "SELECT group_concat(name, ',') FROM pragma_table_info('highlights');" 2>/dev/null)
+  bc=$(sqlite3 -batch "$db" "SELECT group_concat(name, ',') FROM pragma_table_info('bookmarks');" 2>/dev/null)
+  for f in id document_path desc type begin_x begin_y end_x end_y; do [[ ,$hc, == *,$f,* ]] || { hc=; break; }; done
+  for f in id document_path desc offset_y; do [[ ,$bc, == *,$f,* ]] || { bc=; break; }; done
+  if [[ -z $hc || -z $bc ]]; then
+    BRIDGE_MSG="sioyek ↔ KOReader: this sioyek database has a layout the translation doesn't know - skipped"
+    return 0
+  fi
+  # col LIST NAME EXPR [DEFAULT]: EXPR if the table has the column, DEFAULT ('') otherwise.
+  col() { if [[ ,$1, == *,$2,* ]]; then printf '%s' "$3"; else printf '%s' "${4:-''}"; fi; }
+  sqlite3 -batch -noheader -separator $'\t' "$db" "
+    SELECT 'h', document_path, $(col "$hc" uuid "COALESCE(uuid, '')"), hex(COALESCE(desc, '')),
+      $(col "$hc" text_annot "hex(COALESCE(text_annot, ''))"), COALESCE(type, 'a'),
+      begin_x, begin_y, end_x, end_y, -1,
+      $(col "$hc" creation_time "COALESCE(creation_time, '')"), $(col "$hc" modification_time "COALESCE(modification_time, '')"), id
+    FROM highlights
+    UNION ALL
+    SELECT 'b', document_path, $(col "$bc" uuid "COALESCE(uuid, '')"), hex(COALESCE(desc, '')), '', '',
+      $(col "$bc" begin_x "COALESCE(begin_x, -1)" -1), $(col "$bc" begin_y "COALESCE(begin_y, -1)" -1),
+      $(col "$bc" end_x "COALESCE(end_x, -1)" -1), $(col "$bc" end_y "COALESCE(end_y, -1)" -1), COALESCE(offset_y, 0),
+      $(col "$bc" creation_time "COALESCE(creation_time, '')"), $(col "$bc" modification_time "COALESCE(modification_time, '')"), id
+    FROM bookmarks
+    ORDER BY 14;" >"$TMP/br-rows" 2>"$TMP/br.err" || {
+    BRIDGE_MSG="sioyek ↔ KOReader: could not read $(tildify "$db"): $(head -c 200 -- "$TMP/br.err")"; return 1; }
+  while IFS=$'\t' read -r _ md5 _; do rowdocs[$md5]=1; done <"$TMP/br-rows"
+  # KOReader files with annotations, by partial MD5 (their folder's name).
+  while IFS= read -r f; do
+    grep -q '\["annotations"\] = {$' "$stage/$f" 2>/dev/null || continue
+    side=${f%/*}; side=${side##*/}; sidecars[${side%.sdr}]=$f
+  done < <(cd -- "$stage" 2>/dev/null && find . -path './*.sdr/metadata.*.lua' -type f -printf '%P\n')
+  ((${#rowdocs[@]} + ${#sidecars[@]})) || return 0
+  pdf_index
+  : >"$TMP/br-jobs"
+  while IFS=$'\t' read -r rel size mt md5 pmd5; do
+    [[ -n ${rowdocs[$md5]+x} || -n ${sidecars[$pmd5]+x} ]] && [[ -z ${done_md5[$md5]+x} ]] || continue
+    done_md5[$md5]=1
+    ext=${rel##*.}
+    f=${sidecars[$pmd5]:-${pmd5:0:2}/$pmd5.sdr/metadata.$ext.lua}
+    pages=$(pdf_pages "$LIBRARY_ROOT/$rel" "$md5") || { warn "sioyek ↔ KOReader: can't read the pages of $rel - skipped"; continue; }
+    mkdir -p -- "$stage/${f%/*}" || continue
+    [[ -f $stage/$f ]] && { mkdir -p -- "$TMP/br-before/${f%/*}"; cp -- "$stage/$f" "$TMP/br-before/$f"; }
+    printf '%s\t%s\t%s\t%s\t%s\n' "$md5" "$pmd5" "$stage/$f" "-- $KO_DIR/$f" "$pages" >>"$TMP/br-jobs"
+  done <"$PDF_INDEX"
+  [[ -s $TMP/br-jobs ]] || return 0
+  if ! ko_lua bridge "$TMP/br-jobs" "$TMP/br-rows" "$TMP/br.sql" "$hc" "$bc" >"$TMP/br-out" 2>"$TMP/br.err"; then
+    cut -f3 "$TMP/br-jobs" | while IFS= read -r f; do rm -f -- "$f.bridge.tmp"; done
+    BRIDGE_MSG="sioyek ↔ KOReader translation failed: $(head -c 300 -- "$TMP/br.err")"; return 1
+  fi
+  # Folders made for books that got nothing go again (they were empty).
+  cut -f3 "$TMP/br-jobs" | while IFS= read -r f; do rmdir -- "${f%/*}" "${f%/*/*}" 2>/dev/null; done
+  while IFS= read -r line; do
+    case $line in
+      "file $stage/"*) changed+=("${line#"file $stage/"}") ;;
+      "stats "*) read -r -a st <<<"${line#stats }" ;;
+    esac
+  done <"$TMP/br-out"
+  # sioyek's database first: a KOReader file linking to rows that never made it into the database
+  # would read as "deleted in sioyek" next time.
+  if [[ -s $TMP/br.sql ]]; then
+    if ! { mkdir -p -- "$lt/$ANNOT_DIR" && cp -- "$db" "$lt/$ANNOT_DIR/shared.db"; } ||
+      ! { echo 'BEGIN;'; cat -- "$TMP/br.sql"; echo 'COMMIT;'; } | sqlite3 -bail -batch -cmd '.timeout 5000' "$db" 2>"$TMP/br.err"; then
+      for f in "${changed[@]}"; do rm -f -- "$stage/$f.bridge.tmp"; done
+      BRIDGE_MSG="sioyek ↔ KOReader: updating $(tildify "$db") failed, nothing was changed: $(head -c 300 -- "$TMP/br.err")"
+      return 1
+    fi
+    BRIDGE_CHANGED=1
+  fi
+  # Replaced KOReader files go to the trash, like everything a sync replaces.
+  for f in "${changed[@]}"; do
+    [[ -f $TMP/br-before/$f ]] && mkdir -p -- "$lt/$KO_DIR/${f%/*}" && cp -- "$TMP/br-before/$f" "$lt/$KO_DIR/$f"
+    mv -f -- "$stage/$f.bridge.tmp" "$stage/$f" && BRIDGE_CHANGED=1
+  done
+  ((${#st[@]} == 7)) || return 0
+  if ((st[0] + st[1] + st[2])); then BRIDGE_MSG="sioyek → KOReader: ${st[0]} new, ${st[1]} updated, ${st[2]} deleted"; fi
+  if ((st[3] + st[4] + st[5])); then
+    BRIDGE_MSG+="${BRIDGE_MSG:+ · }KOReader → sioyek: ${st[3]} new, ${st[4]} updated, ${st[5]} deleted"
+  fi
+  ((st[6])) && BRIDGE_MSG+="${BRIDGE_MSG:+ · }${st[6]} deletions held back: one side lost most of the other's annotations at once - check before syncing"
+  [[ -n $BRIDGE_MSG ]] && log_line "$BRIDGE_MSG"
+  [[ $mode == upload ]] || return 0
+  base_flags
+  if [[ -s $TMP/br.sql ]] && ! rclone copyto "${BASE[@]}" --backup-dir "$rt/$ANNOT_DIR" -- "$db" "$(rpath "$ANNOT_DIR/shared.db")" </dev/null 2>"$TMP/br.err"; then
+    BRIDGE_MSG+=" - uploading shared.db failed"; rclone_error "$TMP/br.err"; return 1
+  fi
+  if ((${#changed[@]})); then
+    printf '%s\n' "${changed[@]}" >"$TMP/br-up"
+    if ! rclone copy "${BASE[@]}" --files-from "$TMP/br-up" --backup-dir "$rt/$KO_DIR" -- "$stage" "$(rpath "$KO_DIR")" </dev/null 2>"$TMP/br.err"; then
+      BRIDGE_MSG+=" - uploading the KOReader files failed"; rclone_error "$TMP/br.err"; return 1
+    fi
+  fi
+  return 0
+}
+
+bridge_hdr() {
+  printf ' %ssioyek ↔ KOReader%s  now: %s\n\n' "$CB" "$C0" "$( ((BRIDGE)) && echo on || echo off)"
+  say " Highlights (with notes and colors) and bookmarks made in either reader appear in the other after a"
+  say " sync - PDFs only. Needs the '$ANNOT_DIR' and '$KO_DIR' folders synced here, and sqlite3, Lua and mutool."
+}
+
+# bridge_setup [on]: choose on/off (on: skip the choice), then make sure it can run here.
+bridge_setup() {
+  local miss f
+  if [[ ${1:-} != on ]]; then
+    run_menu bridge_hdr "y|On|translate on this device whenever it syncs" "n|Off|only sync the files as they are"
+    case $MENU_KEY in y) ;; n) BRIDGE=0; save_config; return ;; *) return ;; esac
+    cls
+  fi
+  BRIDGE=1
+  for f in "$ANNOT_DIR" "$KO_DIR"; do
+    [[ " ${FOLDERS[*]} " == *" $f "* ]] || { FOLDERS+=("$f"); mkdir -p -- "$LIBRARY_ROOT/$f"; ok "Added '$f' to synced folders."; }
+  done
+  save_config; DIFF_READY=0
+  have sqlite3 || { yesno " sqlite3 (reads sioyek's database) is not installed. Install it?" y && { ((TERMUX)) && confirm_run pkg install -y sqlite || install_sqlite; }; }
+  lua_bin >/dev/null || { yesno " Lua (reads KOReader's files) is not installed. Install it?" y && install_lua; }
+  have mutool || { yesno " mutool (reads PDF page sizes) is not installed. Install it?" y && install_mutool; }
+  miss=$(bridge_missing)
+  if [[ -n $miss ]]; then warn "Still missing: $miss - the translation is skipped until they are installed."
+  else ok "sioyek ↔ KOReader is on: every sync translates what is new on either side."; fi
+  say " KOReader devices also need Book metadata location → hashdocsettings (Settings → KOReader)."
+  pause
+}
+
 # ------------------------------------------------------------- settings --
 settings_hdr() {
   printf ' %sSettings%s\n\n' "$CB" "$C0"
@@ -2166,6 +2760,7 @@ settings_menu() {
       "3|Local folder|where files live on this device ($(tildify "$LIBRARY_ROOT"))" \
       "4|Sioyek|keep sioyek annotations inside the library" \
       "k|KOReader|sync KOReader highlights, notes and reading progress" \
+      "b|sioyek ↔ KOReader|translate highlights and bookmarks between the two readers" \
       "5|Dependencies|check / install rclone and sioyek" \
       "6|Tuning|parallel transfers, API rate limit, bandwidth" \
       "7|Encrypt config|password-protect rclone.conf (OAuth token)" \
@@ -2180,8 +2775,10 @@ settings_menu() {
            warn "Existing files were not moved. Move them yourself or pull into the new folder."; pause; fi ;;
       4) sioyek_setup ;;
       k) koreader_setup ;;
+      b) bridge_setup ;;
       5) cls; SIOYEK_ASKED=0; check_deps; ok "rclone: $(rclone version | head -n1)"; sioyek_installed && ok "sioyek installed"; have sqlite3 && ok "sqlite3: $(command -v sqlite3)"
          lua_bin >/dev/null && ok "lua: $(command -v "$(lua_bin)")"
+         have mutool && ok "mutool: $(command -v mutool)"
          ((TERMUX)) && { termux_share_on && ok "Termux lets other apps open files (allow-external-apps)" || termux_share_setup; }
          pause ;;
       6) tuning ;;
@@ -2319,6 +2916,9 @@ first_run() {
   fi
   sioyek_installed && sioyek_setup
   koreader_detect >/dev/null && yesno " KOReader found on this device. Sync its highlights, notes and reading progress?" y && koreader_setup
+  { sioyek_installed || ko_on; } &&
+    yesno " Translate highlights and bookmarks between sioyek and KOReader (PDFs), so each reader shows the other's?" y &&
+    bridge_setup on
   ok "Setup complete. Tip: run Status first, then Pull."
   pause
 }
@@ -2366,6 +2966,10 @@ Operations
            Merge, books changed on both sides are merged highlight by highlight;
            conflicts follow this device's rule (now: $(ko_policy_desc "$KO_CONFLICT")),
            which c changes for one sync. Fonts, margins and zoom stay per device.
+  sioyek ↔ KOReader (Settings → sioyek ↔ KOReader, PDFs): highlights, their
+           notes and colors, and bookmarks are translated between the two at
+           every sync, both ways; deleting or editing one deletes or edits its
+           counterpart (the newer edit wins). Needs sqlite3, Lua and mutool.
 
 Only the selected folders are synced; logs/, .trash/ and the scripts stay local.
 The file-type filter is per device (e.g. PDFs only on a tablet); the sioyek
