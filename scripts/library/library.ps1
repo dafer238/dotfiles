@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Version = '1.4.1'
+$Version = '1.5.0'
 $Self = $PSCommandPath
 $CfgDir = if ($env:LIBRARY_SYNC_HOME) { $env:LIBRARY_SYNC_HOME } else { Join-Path $env:APPDATA 'library-sync' }
 $CfgFile = Join-Path $CfgDir 'config'
@@ -1738,6 +1738,9 @@ Operations
            sync are kept or deleted on both. Push uploads this device's copy.
   KOReader's book metadata (koreader\ folder) is merged by library.sh on
            Android and Linux; here it is synced as plain files.
+  sioyek <-> KOReader translation of highlights and bookmarks also runs in
+           library.sh (Linux/Android); its results reach this device as rows
+           in shared.db.
 
 Only the selected folders are synced; logs\, .trash\ and the scripts stay local.
 The file-type filter is per device (e.g. PDFs only on a tablet); the sioyek
