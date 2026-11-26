@@ -204,7 +204,7 @@ class Project:
         self.dir = Path(folder).expanduser().resolve()
         self.file = self.dir / PROJECT_FILE
         self.data = {"version": 1, "sources": [], "albums": [], "discs": [], "settings": dict(DEFAULT_SETTINGS),
-                     "plan_basis": "", "plan_manual": False}
+                     "plan_basis": "", "plan_manual": False, "plan_locked": False, "sig_version": 2}
 
     @classmethod
     def load(cls, folder):
@@ -212,6 +212,15 @@ class Project:
         d = json.loads(p.file.read_text(encoding="utf-8"))
         p.data.update(d)
         p.data["settings"] = {**DEFAULT_SETTINGS, **d.get("settings", {})}
+        if d.get("sig_version", 1) < 2:
+            # v1 disc signatures used full paths; convert so built/burned/verified states are kept
+            for disc in p.discs:
+                old, new = disc_sig(p, disc, legacy=True), disc_sig(p, disc)
+                for st in disc.get("status", {}).values():
+                    if st.get("sig") == old:
+                        st["sig"] = new
+            p.data["sig_version"] = 2
+            p.save()
         return p
 
     def save(self):
@@ -485,13 +494,14 @@ def scan_project(P, progress=None):
     except OSError:
         pass
 
+    built = [a for a in (build_album(folder, parts, probes) for folder, parts in groups.items()) if a]
     old = {a["folder"]: a for a in P.albums}
+    # a renamed/moved folder keeps its files: recognise it by them so its id, edits and CDs survive
+    found = {a["folder"] for a in built}
+    moved = {album_fingerprint(a): a for a in P.albums if a["folder"] not in found}
     albums = []
-    for folder, parts in groups.items():
-        a = build_album(folder, parts, probes)
-        if not a:
-            continue
-        prev = old.get(a["folder"])
+    for a in built:
+        prev = old.get(a["folder"]) or moved.get(album_fingerprint(a))
         if prev:
             a["id"] = prev["id"]
             a["include"] = prev.get("include", True)
@@ -499,9 +509,9 @@ def scan_project(P, progress=None):
             for k in prev.get("edited", []):
                 a[k] = prev[k]
             a["edited"] = prev.get("edited", [])
-            pt = {(t["path"], t.get("cue_start")): t for t in prev["tracks"]}
+            pt = {(Path(t["path"]).name, t.get("cue_start")): t for t in prev["tracks"]}
             for t in a["tracks"]:
-                q = pt.get((t["path"], t.get("cue_start")))
+                q = pt.get((Path(t["path"]).name, t.get("cue_start")))
                 if q:
                     t["include"] = q.get("include", True)
                     if q.get("title"):
@@ -608,6 +618,11 @@ def track_rec(path, pr, tags, part, dur, cue_start, cue_end, n):
             "channels": pr["channels"], "size": pr["size"], "mtime": pr["mtime"], "part": part,
             "cue_start": cue_start, "cue_end": cue_end, "include": True, "tags": tags,
             "_disc": num(tags.get("disc") or tags.get("discnumber")), "_n": n}
+
+
+def album_fingerprint(a):
+    """identifies an album by its files (names + sizes), independent of where its folder is"""
+    return tuple(sorted((Path(t["path"]).name, t.get("size"), t.get("cue_start")) for t in a["tracks"]))
 
 
 def album_quality_score(a):
@@ -775,11 +790,41 @@ def auto_plan(P):
              "segments": [{"album": u["album"], "tracks": u["tracks"], "part": u["part"]} for u in b], "status": {}}
         d["status"] = old.get(disc_sig(P, d), {})
         discs.append(d)
+    if P.discs:
+        P.data["plan_undo"] = {"discs": P.discs, "plan_basis": P.data.get("plan_basis", ""),
+                               "plan_manual": P.data.get("plan_manual", False), "at": now_iso()}
     P.data["discs"] = discs
     P.data["plan_basis"] = plan_basis(P)
     P.data["plan_manual"] = False
     P.save()
     return discs
+
+
+def undo_plan(P):
+    """swap the current plan with the one before the last re-plan (so undo can itself be undone)"""
+    u = P.data.get("plan_undo")
+    if not u:
+        return False
+    cur = {"discs": P.discs, "plan_basis": P.data.get("plan_basis", ""),
+           "plan_manual": P.data.get("plan_manual", False), "at": now_iso()}
+    # keep states (built/burned/verified) gathered since, for discs that exist in both plans
+    states = {}
+    for d in P.discs + u["discs"]:
+        for k, st in d.get("status", {}).items():
+            prev = states.setdefault(st.get("sig"), {}).get(k)
+            if not prev or st.get("at", "") > prev.get("at", ""):
+                states[st.get("sig")][k] = st
+    P.data["discs"] = u["discs"]
+    for d in P.discs:
+        d["status"] = dict(states.get(disc_sig(P, d), {}))
+    P.data["plan_basis"], P.data["plan_manual"] = u["plan_basis"], u["plan_manual"]
+    P.data["plan_undo"] = cur
+    P.save()
+    return True
+
+
+def burned_count(P):
+    return sum(1 for d in P.discs if disc_state(P, d)["burned"])
 
 
 def disc_duration(P, d):
@@ -832,15 +877,16 @@ def disc_entries(P, d):
     return out
 
 
-def disc_sig(P, d):
-    """identifies the audio of a disc: same sig = the built image is still valid"""
+def disc_sig(P, d, legacy=False):
+    """identifies the audio of a disc: same sig = the built image is still valid.
+    Uses file names (not full paths), so renaming or moving a music folder keeps it."""
     S = P.S
     parts = []
     for s in d["segments"]:
         a = P.album(s["album"])
         if not a:
             return "missing"
-        parts.append([[t["path"], t.get("cue_start"), t.get("cue_end"), t.get("size"), t.get("mtime")]
+        parts.append([[t["path"] if legacy else Path(t["path"]).name, t.get("cue_start"), t.get("cue_end"), t.get("size"), t.get("mtime")]
                       for t in (a["tracks"][i] for i in s["tracks"] if i < len(a["tracks"]))])
     marks = [[e["seg"], e["idx"][0]] for e in disc_entries(P, d)]
     blob = json.dumps([parts, marks, S["gap_s"], S["precision"], S["dither"], S["ceiling_db"], has_soxr()])
@@ -888,8 +934,18 @@ def find_disc(P, name):
 
 
 # ------------------------------------------------------------- audio build --
+# ffmpeg messages about embedded cover art (broken/empty picture blocks) - the audio is unaffected
+HARMLESS_FF = re.compile(r"attached picture|mimetype|cover art|Invalid PNG|image2", re.I)
+
+
 def ffmpeg(args, stdout=None):
-    subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y"] + args, stdout=stdout, check=True)
+    r = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-y"] + args,
+                       stdout=stdout, stderr=subprocess.PIPE)
+    msgs = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip() and not HARMLESS_FF.search(x)]
+    if r.returncode:
+        raise RuntimeError("ffmpeg failed: " + " | ".join(msgs[-5:]))
+    for m in msgs:
+        warn(f"ffmpeg: {m}")
 
 
 def float_peak(path):
@@ -1877,14 +1933,19 @@ def do_scan():
         b = P.album(a["dup_of"])
         if b:
             info(f"Duplicate: kept {quality_label(b['tracks'])} '{b['title']}', skipped {quality_label(a['tracks'])} copy in {tildify(a['folder'])}")
-    if not P.discs or (plan_stale(P) and not P.data.get("plan_manual")):
+    if not P.discs:
         try:
             auto_plan(P)
             ok(f"Planned {len(P.discs)} CDs.")
         except ValueError as e:
             err(str(e))
-    elif plan_stale(P):
-        warn("Albums changed and your plan has manual edits: re-plan from the Plan menu when ready.")
+    else:
+        # never touch an existing plan here: its CDs may be burned and their labels printed
+        broken = [n for n, d in enumerate(P.discs, 1) if disc_problems(P, d)]
+        if broken:
+            warn("Albums on " + ", ".join(f"CD{n:02d}" for n in broken) + " changed or are missing - see Plan.")
+        elif plan_stale(P):
+            info("Your plan is unchanged. (Albums or settings differ from when it was made; re-plan only if you want to.)")
     pause()
 
 
@@ -2079,9 +2140,20 @@ def plan_hdr():
     tot = sum(disc_duration(P, d) for d in P.discs)
     s = (f" {CB}Plan{C0}  {len(P.discs)} CDs · {mmss(tot)} of music · max {mmss(P.budget())} per {P.S['capacity_min']}-min CD"
          f" · combine: {P.S['combine']}\n")
-    if plan_stale(P):
-        s += f" {CY}Albums or settings changed since this plan was made - press r to re-plan{C0}\n"
+    if P.data.get("plan_locked"):
+        s += f" {CG}🔒 locked{C0} {CD}- labels printed: the CDs and their numbers can't change (L unlocks){C0}\n"
+    elif plan_stale(P):
+        s += f" {CY}Albums or settings changed since this plan was made.{C0} {CD}It still works; r re-plans only if you want to.{C0}\n"
+    if P.data.get("plan_undo") and not P.data.get("plan_locked"):
+        s += f" {CD}u undoes the last re-plan ({P.data['plan_undo'].get('at', '')}){C0}\n"
     return s
+
+
+def plan_locked_msg():
+    cls()
+    warn("The plan is locked (labels printed), so CDs can't be regrouped or renumbered.")
+    say("   Unlock it with L in the Plan menu if you really want to change it.")
+    pause()
 
 
 def plan_menu():
@@ -2101,15 +2173,38 @@ def plan_menu():
                 return
         h, w = term_size()
         k, pos = list_view(plan_hdr, plan_rows(w), pos,
-                           footer="enter disc · r re-plan · J/K move disc · b build · w burn · v verify · i label",
-                           keys=("r", "J", "K", "b", "w", "i", "v"))
+                           footer="enter disc · r re-plan · u undo re-plan · L lock · J/K move disc · b build · w burn · v verify · i label",
+                           keys=("r", "u", "L", "J", "K", "b", "w", "i", "v"))
         if k == "q":
             return
         d = P.discs[pos] if P.discs else None
-        if k == "r":
+        locked = P.data.get("plan_locked")
+        if k in ("r", "u", "J", "K") and locked:
+            plan_locked_msg()
+        elif k == "L":
+            P.data["plan_locked"] = not locked
+            P.save()
+        elif k == "u":
             cls()
-            msg = " Re-plan automatically?" + (" Your manual changes to the plan will be lost." if P.data.get("plan_manual") else "")
-            if yesno(msg, "y"):
+            u = P.data.get("plan_undo")
+            if not u:
+                info("Nothing to undo.")
+                pause()
+            elif yesno(f" Go back to the plan from before the last re-plan ({len(u['discs'])} CDs, {u.get('at', '')})?", "y"):
+                undo_plan(P)
+                ok("Previous plan restored (u again switches back).")
+                pause()
+        elif k == "r":
+            cls()
+            nb = burned_count(P)
+            say(" Re-planning regroups and renumbers the CDs from scratch (Settings › combine: "
+                f"{P.S['combine']}, max {P.S['max_per_disc']} per CD).")
+            if nb:
+                warn(f"{nb} CD(s) are already burned: if their number or contents change, labels you printed won't match.")
+            if P.data.get("plan_manual"):
+                warn("Your manual changes to the plan will be lost.")
+            say(f" {CD}You can undo it afterwards with u.{C0}")
+            if yesno(" Re-plan now?", "n" if nb else "y"):
                 try:
                     auto_plan(P)
                 except ValueError as e:
@@ -2178,6 +2273,8 @@ def disc_menu(pos):
                     if e["seg"] == si:
                         lines.append(f"  {e['n']:2d}. {pad(e['title'], 60)} {mmss(e['duration']):>6}")
             pager(f"CD{n:02d} track list", lines)
+        elif k in ("m", "c", "s") and P.data.get("plan_locked"):
+            plan_locked_msg()
         elif k in ("m", "c"):
             move_flow(pos, whole=(k == "c"))
         elif k == "s":
@@ -2346,10 +2443,15 @@ def labels_menu():
             ("o", "Open labels", "write labels.html and open it in the browser"),
             ("t", "Track lists", "write tracklists.txt (all CDs, plain text) and view it"),
             ("f", "Folder", "open the project folder"),
+            ("p", "Lock plan", ("on" if P.data.get("plan_locked") else "off")
+             + " - once labels are printed, lock so CDs are never regrouped or renumbered"),
         ], key="labels")
         if k == "q":
             return
-        if k == "o":
+        if k == "p":
+            P.data["plan_locked"] = not P.data.get("plan_locked")
+            P.save()
+        elif k == "o":
             labels_open()
         elif k == "t":
             write_labels(P)
@@ -2626,9 +2728,10 @@ def resolve_project(arg):
 
 
 def print_status(P):
-    say(f"{CB}{tildify(P.dir)}{C0}  {len(P.albums)} albums · {len(P.discs)} CDs · max {mmss(P.budget())} per CD")
-    if plan_stale(P):
-        warn("albums or settings changed since the plan was made (cdburn plan)")
+    say(f"{CB}{tildify(P.dir)}{C0}  {len(P.albums)} albums · {len(P.discs)} CDs · max {mmss(P.budget())} per CD"
+        + ("  🔒 plan locked" if P.data.get("plan_locked") else ""))
+    if plan_stale(P) and not P.data.get("plan_locked"):
+        info("albums or settings changed since the plan was made; it still works ('cdburn plan' re-plans)")
     w = term_size()[1]
     for r in plan_rows(w if TTY else 140):
         say("  " + r)
@@ -2641,7 +2744,9 @@ def main(argv=None):
     ap.add_argument("-V", "--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("new"); s.add_argument("dirs", nargs="+")
-    sub.add_parser("scan"); sub.add_parser("plan"); sub.add_parser("status"); sub.add_parser("menu")
+    sub.add_parser("scan"); sub.add_parser("status"); sub.add_parser("menu")
+    s = sub.add_parser("plan"); s.add_argument("--undo", action="store_true"); s.add_argument("--force", action="store_true")
+    s.add_argument("--lock", action="store_true"); s.add_argument("--unlock", action="store_true")
     s = sub.add_parser("build"); s.add_argument("discs", nargs="+"); s.add_argument("-j", "--jobs", type=int)
     s = sub.add_parser("burn"); s.add_argument("disc"); s.add_argument("--simulate", action="store_true")
     s.add_argument("--speed", type=int); s.add_argument("--device"); s.add_argument("-y", "--yes", action="store_true")
@@ -2675,7 +2780,8 @@ def main(argv=None):
         for al in albums:
             if al.get("dup_of"):
                 info(f"skipped duplicate (lower quality): {tildify(al['folder'])}")
-        auto_plan(P)
+        if not P.discs:
+            auto_plan(P)
         print_status(P)
         return
     if cmd == "menu":
@@ -2703,7 +2809,21 @@ def main(argv=None):
         if plan_stale(P):
             warn("the plan is out of date - run: cdburn plan")
     elif cmd == "plan":
-        auto_plan(P)
+        if a.lock or a.unlock:
+            P.data["plan_locked"] = bool(a.lock)
+            P.save()
+            ok("Plan locked." if a.lock else "Plan unlocked.")
+        elif P.data.get("plan_locked") and not a.force:
+            raise SystemExit("The plan is locked (labels printed). Use --unlock first, or --force.")
+        elif a.undo:
+            if not undo_plan(P):
+                raise SystemExit("Nothing to undo.")
+            ok("Previous plan restored.")
+        else:
+            nb = burned_count(P)
+            if nb and not a.force:
+                raise SystemExit(f"{nb} CD(s) are already burned - re-planning may renumber them. Add --force to do it anyway.")
+            auto_plan(P)
         print_status(P)
     elif cmd == "status":
         print_status(P)

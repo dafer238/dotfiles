@@ -29,13 +29,13 @@ cdburn            # menus: j/k move · enter/l open · space tick · h/esc back 
 The first run asks for your music folder(s) and a project folder (default `<music>/_CD_Burning`). After that:
 
 1. **Albums** (`a`): check what was found. Untick albums or single tracks, and fix artist, title or year.
-2. **Plan** (`p`): CDs are planned automatically. Use `enter` on a CD to move or combine albums, `J`/`K` to reorder, and `r` to re-plan.
+2. **Plan** (`p`): CDs are planned automatically. Use `enter` on a CD to move or combine albums, `J`/`K` to reorder, and `r` to re-plan. `u` undoes the last re-plan. **`L` locks the plan.** Do this once you've printed the labels, so CDs are never regrouped or renumbered (Labels › Lock plan does the same).
 3. **Build** (`b`): makes the images (several CDs in parallel).
 4. **Burn** (`w`): the first time, it offers a simulation first (laser off). Afterwards it offers to verify.
 5. **Labels** (`i`): opens `labels.html`. Tick the CDs you want, then print at **100% / no margins**. You get 2 labels per A4 sheet (117 mm label, 41 mm hole, adjustable).
 6. **Clean up** (`x`): delete images of CDs you've already burned (about 0.4–0.85 GB each).
 
-The menus remember everything. A CD whose albums or settings changed shows **outdated** and is rebuilt.
+The menus remember everything. A CD whose albums or settings changed shows **outdated** and is rebuilt. Rescanning never re-plans an existing plan. Renaming or moving music folders is fine: albums are recognised by their files.
 
 ## What gets found
 
@@ -72,7 +72,7 @@ Artist, title and year come from the tags, then from the folder name. Remaster a
 ```bash
 cdburn new ~/Music/albums [-p ~/Music/albums/_CD_Burning]
 cdburn status                 # plan + state of every CD
-cdburn scan | plan
+cdburn scan | plan [--undo | --lock | --unlock | --force]
 cdburn build CD01 CD02 | all [-j 4]
 cdburn burn CD05 [--simulate] [--speed 16] [--device /dev/sr0]
 cdburn verify CD05            # Windows: --readback rip.wav (whole-disc WAV, e.g. from EAC)
